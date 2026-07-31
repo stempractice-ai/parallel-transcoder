@@ -1,0 +1,48 @@
+# External access to transcoder-web via OCI Native Ingress Controller.
+# Required because OKE Virtual Nodes carry
+# node.kubernetes.io/exclude-from-external-load-balancers=true and run no
+# kube-proxy/NodePort listener, so a plain type:LoadBalancer Service
+# registers an unreachable backend. NIC provisions its own OCI LB and
+# routes directly to pod IPs (VCN-native CNI), sidestepping NodePort
+# entirely.
+apiVersion: ingress.oraclecloud.com/v1beta1
+kind: IngressClassParameters
+metadata:
+  name: transcoder-web-lb-params
+  namespace: transcoder
+spec:
+  compartmentId: "ocid1.tenancy.oc1..aaaaaaaavngkzjmfd43hvy3pmqyku5clybgc5kmsquxsydxdildgvbpbrkla"
+  subnetId: "ocid1.subnet.oc1.iad.aaaaaaaabssxlkzqrulyxajydi5ob2xj6yglt5y664gewtf5fg64zu6xieha"
+  minBandwidthMbps: 10
+  maxBandwidthMbps: 10
+---
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: transcoder-web-nic
+spec:
+  controller: oci.oraclecloud.com/native-ingress-controller
+  parameters:
+    apiGroup: ingress.oraclecloud.com
+    kind: IngressClassParameters
+    name: transcoder-web-lb-params
+    namespace: transcoder
+    scope: Namespace
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: transcoder-web
+  namespace: transcoder
+spec:
+  ingressClassName: transcoder-web-nic
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: transcoder-web
+                port:
+                  number: 80

@@ -1,0 +1,112 @@
+# OKE Virtual Nodes worker pool (Pod.Standard.A1.Flex, serverless ARM64)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: transcoder-worker-cpu
+  labels:
+    app.kubernetes.io/name: transcoder-node
+    pool: cpu-worker
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: transcoder-node
+      pool: cpu-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: transcoder-node
+        pool: cpu-worker
+    spec:
+      serviceAccountName: transcoder-node
+      terminationGracePeriodSeconds: 30
+      imagePullSecrets:
+        - name: ocir-secret
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 50
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    statefulset.kubernetes.io/pod-name: transcoder-node-0
+      containers:
+        - name: transcoder-node
+          image: transcoder-node:dev
+          # Shell wrapper (matching the StatefulSet's) so OBJECT_STORE_URL
+          # actually reaches the CLI as --object-store-url — a plain exec
+          # array here doesn't do env-to-flag substitution, so workers were
+          # silently starting with no object-store client at all and failing
+          # every segment that referenced an s3:// input.
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              ARGS="--listen 0.0.0.0:9900 --k8s-mode \
+                --join transcoder-node-0.transcoder.transcoder.svc.cluster.local:9900 \
+                --worker-binary /usr/local/bin/transcoder-worker \
+                --lib-dir /usr/local/lib"
+              if [ -n "${OBJECT_STORE_URL:-}" ]; then
+                ARGS="$ARGS --object-store-url $OBJECT_STORE_URL"
+              fi
+              exec /usr/bin/tini -- /usr/local/bin/transcoder-node $ARGS
+          env:
+            - name: ENCODER_GPU
+              value: "none"
+            - name: ENCODER_CPU_FEATURE
+              value: "baseline"
+            - name: POD_ORDINAL
+              value: "100"
+            - name: OBJECT_STORE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: transcoder-config
+                  key: object-store-url
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: oci-s3-credentials
+                  key: access-key-id
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: oci-s3-credentials
+                  key: secret-access-key
+            - name: AWS_REGION
+              value: "us-ashburn-1"
+          ports:
+            - name: cluster-ws
+              containerPort: 9900
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: 9900
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 9900
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "kill -TERM 1; sleep 2"]
+          # Virtual nodes require requests == limits (fixed pod-shape
+          # allocation, no bursting) and reject emptyDir.sizeLimit.
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+          volumeMounts:
+            - name: scratch
+              mountPath: /var/lib/transcoder/tmp
+      volumes:
+        - name: scratch
+          emptyDir: {}

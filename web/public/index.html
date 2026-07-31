@@ -1882,7 +1882,7 @@ body::before {
 
           <div class="field">
             <label class="field-label" for="optWorkers">Workers</label>
-            <input type="number" id="optWorkers" min="0" value="0" placeholder="0 = auto">
+            <input type="number" id="optWorkers" min="0" value="5" placeholder="0 = auto">
           </div>
 
           <div class="field full-width" id="grpTolerance">
@@ -1922,9 +1922,9 @@ body::before {
         <div class="section-label">Cluster</div>
 
         <div class="cluster-mode-bar" role="radiogroup" aria-label="Cluster mode">
-          <button class="cluster-mode-btn active" data-mode="off" type="button">Off</button>
+          <button class="cluster-mode-btn" data-mode="off" type="button">Off</button>
           <button class="cluster-mode-btn" data-mode="local" type="button">Local</button>
-          <button class="cluster-mode-btn" data-mode="remote" type="button">Remote</button>
+          <button class="cluster-mode-btn active" data-mode="remote" type="button">Remote</button>
           <button class="cluster-mode-btn" data-mode="k8s" id="modeBtnK8s" type="button" style="display:none">K8s</button>
         </div>
 
@@ -1940,7 +1940,7 @@ body::before {
         </div>
 
         <!-- Off pane -->
-        <div class="cluster-pane" data-pane="off">
+        <div class="cluster-pane" data-pane="off" style="display:none">
           <div class="cluster-pane-help">Transcoding runs on this machine. Pick a mode above to fan work out to a cluster.</div>
         </div>
 
@@ -1960,11 +1960,11 @@ body::before {
         </div>
 
         <!-- Remote pane -->
-        <div class="cluster-pane" data-pane="remote" style="display:none">
+        <div class="cluster-pane" data-pane="remote">
           <div class="cluster-pane-help">Connect this UI to a transcoder-node master that's already running somewhere else.</div>
           <label class="field-label" for="clusterMaster">Master address</label>
           <div class="cluster-row">
-            <input type="text" id="clusterMaster" placeholder="host:port" spellcheck="false">
+            <input type="text" id="clusterMaster" value="transcoder-master.transcoder.svc.cluster.local:9900" placeholder="host:port" spellcheck="false">
             <button class="url-import-btn" id="clusterConnectBtn" type="button">Connect</button>
           </div>
         </div>
@@ -2807,12 +2807,15 @@ body::before {
       var hasDesktopCluster = !!(window.desktop && window.desktop.cluster);
       var hasDesktopK8s     = !!(window.desktop && window.desktop.k8s);
 
-      // Restore state
-      var savedMode = 'off';
-      var savedMaster = '';
+      // Restore state — default to remote cluster mode against the in-cluster
+      // master service, so the UI works out of the box against a k8s deployment.
+      var DEFAULT_MODE = 'remote';
+      var DEFAULT_MASTER = 'transcoder-master.transcoder.svc.cluster.local:9900';
+      var savedMode = DEFAULT_MODE;
+      var savedMaster = DEFAULT_MASTER;
       try {
-        savedMode = localStorage.getItem('cluster.mode') || 'off';
-        savedMaster = localStorage.getItem('cluster.master') || '';
+        savedMode = localStorage.getItem('cluster.mode') || DEFAULT_MODE;
+        savedMaster = localStorage.getItem('cluster.master') || DEFAULT_MASTER;
       } catch (e) {}
 
       // Mode bar wiring

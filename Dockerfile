@@ -29,6 +29,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       curl \
       git \
       libtool \
+      libx264-dev \
       nasm \
       pkg-config \
       yasm \
@@ -50,6 +51,7 @@ RUN curl -fsSL "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz" \
          --disable-txtpages \
          --enable-gpl \
          --enable-version3 \
+         --enable-libx264 \
     && make -j"$(nproc)" \
     && make install \
     && cd / && rm -rf /build
@@ -124,6 +126,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libxcb1 \
       libxext6 \
       libxv1 \
+      libx264-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # FFmpeg shared libs + binaries from the build stage.

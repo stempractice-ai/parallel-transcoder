@@ -1,0 +1,54 @@
+# OKE master on OKE Virtual Nodes (Pod.Standard.A1.Flex, serverless ARM64).
+# Virtual nodes carry no node.kubernetes.io/instance-type label and no
+# taints, so no nodeAffinity/toleration is needed — this cluster has only
+# one (virtual) node pool.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: transcoder-node
+spec:
+  replicas: 1
+  template:
+    spec:
+      imagePullSecrets:
+        - name: ocir-secret
+      containers:
+        - name: transcoder-node
+          env:
+            - name: OBJECT_STORE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: transcoder-config
+                  key: object-store-url
+            - name: OBJECT_STORE_BUCKET
+              valueFrom:
+                configMapKeyRef:
+                  name: transcoder-config
+                  key: object-store-bucket
+            - name: ENCODER_GPU
+              value: "none"
+            - name: ENCODER_CPU_FEATURE
+              value: "baseline"
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: oci-s3-credentials
+                  key: access-key-id
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: oci-s3-credentials
+                  key: secret-access-key
+            - name: AWS_REGION
+              value: "us-ashburn-1"
+          # Virtual nodes require requests == limits (fixed pod-shape
+          # allocation, no bursting). base/statefulset.yaml already drops
+          # emptyDir.sizeLimit (virtual nodes reject it) — a strategic-merge
+          # patch here can't clear that field, so it's fixed at the source.
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"

@@ -10,6 +10,7 @@ import fsp from "fs/promises";
 import { fileURLToPath } from "url";
 import http from "http";
 import https from "https";
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const RESOURCES_DIR = process.env.TRANSCODER_RESOURCES_DIR || path.join(__dirname, "..");
@@ -23,6 +24,41 @@ const PORT = DESKTOP_MODE ? 0 : parseInt(process.env.PORT || "3000", 10);
 const HOST = DESKTOP_MODE ? "127.0.0.1" : undefined;
 const DEFAULT_CLUSTER_MASTER = process.env.CLUSTER_MASTER || "localhost:9900";
 const MAX_LOG_LINES = 200;
+
+// Object storage (K8s mode only) — same bucket the cluster nodes use for
+// segment transfer. When configured, cluster-mode submissions upload the
+// raw source video here so the master can download, cut real segments,
+// and re-upload them; without this the master has no way to reach a file
+// that only exists on the web pod's local disk.
+const OBJECT_STORE_URL = process.env.OBJECT_STORE_URL || null;
+const OBJECT_STORE_BUCKET = process.env.OBJECT_STORE_BUCKET || "transcoder-segments";
+const s3Client = OBJECT_STORE_URL
+  ? new S3Client({
+      endpoint: OBJECT_STORE_URL,
+      region: process.env.AWS_REGION || "us-east-1",
+      forcePathStyle: true,
+      credentials: {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+      },
+    })
+  : null;
+
+/** Upload the local source file to the object store; returns an s3:// URI. */
+async function uploadSourceToObjectStore(jobId, inputPath) {
+  const key = `jobs/${jobId}/source/${path.basename(inputPath)}`;
+  // A stream Body makes the SDK default to aws-chunked transfer encoding,
+  // which OCI's S3-compat endpoint rejects ("AWS chunked encoding not
+  // supported"). Buffering avoids that path entirely — fine at these
+  // (tens-of-MB) upload sizes.
+  const body = await fsp.readFile(inputPath);
+  await s3Client.send(new PutObjectCommand({
+    Bucket: OBJECT_STORE_BUCKET,
+    Key: key,
+    Body: body,
+  }));
+  return `s3://${OBJECT_STORE_BUCKET}/${key}`;
+}
 
 /** Resolve cluster master from request (query/body), falling back to env default. */
 function resolveMaster(req) {
@@ -492,6 +528,11 @@ app.post("/api/cluster/transcode", async (req, res) => {
   const jobId = crypto.randomUUID();
 
   try {
+    let srtInputUrl = null;
+    if (s3Client) {
+      srtInputUrl = await uploadSourceToObjectStore(jobId, inputPath);
+    }
+
     const result = await submitClusterJob(master, {
       jobId,
       inputPath,
@@ -499,6 +540,7 @@ app.post("/api/cluster/transcode", async (req, res) => {
       crf,
       preset,
       encoder,
+      srtInputUrl,
     });
     res.json({ jobId, master, status: "submitted", clusterId: result.jobId });
   } catch (err) {
@@ -765,14 +807,17 @@ function queryCluster(master, timeout = 5000) {
 }
 
 /** Submit a transcode job to the cluster master. */
-function submitClusterJob(master, { jobId, inputPath, format, crf, preset, encoder }) {
+function submitClusterJob(master, { jobId, inputPath, format, crf, preset, encoder, srtInputUrl }) {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(`ws://${master}`);
 
+    // The master now downloads the source, cuts real segments with ffmpeg,
+    // and uploads each one before replying — generous enough for a
+    // multi-minute video on a single CPU core.
     const timer = setTimeout(() => {
       ws.close();
       reject(new Error("Cluster job submission timed out"));
-    }, 10000);
+    }, 120000);
 
     ws.on("open", () => {
       const fileSize = fs.statSync(inputPath).size;
@@ -791,7 +836,7 @@ function submitClusterJob(master, { jobId, inputPath, format, crf, preset, encod
             fast_mode: true,
             hw_decode: false,
           },
-          srt_input_url: null,
+          srt_input_url: srtInputUrl || null,
         },
       }));
     });

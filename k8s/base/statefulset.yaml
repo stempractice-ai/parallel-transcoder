@@ -108,5 +108,4 @@ spec:
               mountPath: /var/lib/transcoder/tmp
       volumes:
         - name: scratch
-          emptyDir:
-            sizeLimit: 20Gi
+          emptyDir: {}

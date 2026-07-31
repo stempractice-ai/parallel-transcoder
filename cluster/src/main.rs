@@ -211,7 +211,7 @@ impl App {
             // -- Handshake --
             OpCode::Hello => self.handle_hello(peer_addr),
             OpCode::Identify => self.handle_identify(peer_addr, &message),
-            OpCode::Identified => self.handle_identified(&message),
+            OpCode::Identified => self.handle_identified(peer_addr, &message),
 
             // -- Election --
             OpCode::ElectionStart => self.handle_election_start(peer_addr, &message),
@@ -301,7 +301,7 @@ impl App {
     }
 
     /// Process an Identified response: learn about the cluster.
-    fn handle_identified(&mut self, msg: &Message) {
+    fn handle_identified(&mut self, peer_addr: SocketAddr, msg: &Message) {
         let Ok(data) = msg.parse_data::<IdentifiedData>() else {
             warn!("Failed to parse Identified payload");
             return;
@@ -312,6 +312,14 @@ impl App {
             cluster_size = data.cluster_nodes.len(),
             "Handshake complete"
         );
+
+        // Associate this connection with the peer's node_id. Identified is
+        // sent in reply to our own Identify, and — unlike handle_identify —
+        // nothing else ever tags this side of the connection, so without
+        // this the scheduler can never find a live peer address for anyone
+        // who connected *to* us (i.e. every worker, since they always join
+        // us, never the other way around).
+        self.transport.set_peer_node_id(&peer_addr, data.node_id);
 
         // Register all advertised cluster nodes.
         for node in data.cluster_nodes {
@@ -434,8 +442,33 @@ impl App {
             "Job submitted"
         );
 
-        // Analyze the video to produce segment descriptors.
-        let segments = analyze_video(&data);
+        // In K8s mode the submitter uploads the source video to the object
+        // store first and points us at it via srt_input_url (an s3:// URI
+        // despite the field name — same field, no protocol/version bump).
+        // We download it, cut real segments with ffmpeg, and upload each
+        // segment back to the bucket at the key the scheduler already
+        // expects (jobs/{job_id}/input/seg_{id}.ts). Without this step
+        // there's nothing at that key and every segment assignment fails
+        // with NoSuchKey once a worker tries to fetch it.
+        let segments = match (&self.object_store, &data.srt_input_url) {
+            (Some(store), Some(uri)) if is_s3_uri(uri) => {
+                match segment_and_upload(store, data.job_id, uri).await {
+                    Ok(segments) => segments,
+                    Err(e) => {
+                        warn!(job_id = %data.job_id, error = ?e, "Failed to segment source video");
+                        let err = ErrorData {
+                            code: 500,
+                            message: format!("Failed to segment source video: {:?}", e),
+                        };
+                        if let Ok(resp) = Message::new(OpCode::Error, &err) {
+                            let _ = self.transport.send_to(&peer_addr, resp);
+                        }
+                        return;
+                    }
+                }
+            }
+            _ => analyze_video(&data),
+        };
         let total_segments = segments.len();
 
         // Store job context for later segment distribution.
@@ -476,7 +509,20 @@ impl App {
             return;
         }
 
-        let active = self.nodes.active_nodes();
+        // NodeManager tracks nodes it has merely heard *about* (e.g. gossiped
+        // via another peer's Identified payload) the same way as nodes it has
+        // a live transport connection to — both look "Active" with a fresh
+        // heartbeat. Only nodes we can actually reach over the transport are
+        // eligible for scheduling, or SegmentAssign has nowhere to go and the
+        // segment sits stuck forever. This also excludes the master's own
+        // node_id: there is no local-execution path for segments, only
+        // connected workers can ever run one.
+        let active: Vec<_> = self
+            .nodes
+            .active_nodes()
+            .into_iter()
+            .filter(|n| self.transport.find_peer_addr(&n.node_id).is_some())
+            .collect();
         if active.is_empty() {
             return;
         }
@@ -512,22 +558,39 @@ impl App {
                 encoding_config: ctx.config.clone(),
             };
 
-            if let Ok(msg) = Message::new(OpCode::SegmentAssign, &assign_data) {
-                if let Some(addr) = self.transport.find_peer_addr(&node_id) {
-                    if let Err(e) = self.transport.send_to(&addr, msg) {
-                        warn!(
-                            %node_id, segment_id = segment.id,
-                            "Failed to send SegmentAssign: {}", e
-                        );
-                    } else {
-                        debug!(
-                            %job_id, segment_id = segment.id, %node_id,
-                            "Segment assigned"
-                        );
+            let sent = if let Ok(msg) = Message::new(OpCode::SegmentAssign, &assign_data) {
+                match self.transport.find_peer_addr(&node_id) {
+                    Some(addr) => match self.transport.send_to(&addr, msg) {
+                        Ok(()) => {
+                            debug!(
+                                %job_id, segment_id = segment.id, %node_id,
+                                "Segment assigned"
+                            );
+                            true
+                        }
+                        Err(e) => {
+                            warn!(
+                                %node_id, segment_id = segment.id,
+                                "Failed to send SegmentAssign: {}", e
+                            );
+                            false
+                        }
+                    },
+                    None => {
+                        warn!(%node_id, segment_id = segment.id, "No peer address, cannot assign segment");
+                        false
                     }
-                } else {
-                    warn!(%node_id, "No peer address, cannot assign segment");
                 }
+            } else {
+                false
+            };
+
+            // The connection may have dropped between scheduling and sending
+            // (or the node was never actually reachable). Requeue rather than
+            // dropping the segment on the floor, so the next scheduling tick
+            // retries against whichever nodes are genuinely connected.
+            if !sent {
+                self.scheduler.requeue_segment(&job_id, segment);
             }
         }
     }
@@ -924,6 +987,148 @@ fn analyze_video(data: &JobSubmitData) -> Vec<SegmentDescriptor> {
 }
 
 // ---------------------------------------------------------------------------
+// Real segmentation (K8s mode, object-store-backed input)
+// ---------------------------------------------------------------------------
+
+const K8S_SEGMENT_DURATION_SECS: f64 = 10.0;
+
+/// Download the source video from `source_uri`, cut it into fixed-duration
+/// segments with ffmpeg's segment muxer (stream copy, keyframe-aligned —
+/// no re-encoding here, the actual encode happens per-segment on workers),
+/// upload each piece to the object store at the key the scheduler already
+/// expects, and return real segment descriptors built from ffprobe's
+/// reported duration.
+async fn segment_and_upload(
+    store: &ObjectStore,
+    job_id: JobId,
+    source_uri: &str,
+) -> Result<Vec<SegmentDescriptor>> {
+    use tokio::process::Command;
+
+    let work_dir = std::env::temp_dir().join(format!("transcoder-segment-{}", job_id));
+    tokio::fs::create_dir_all(&work_dir).await?;
+    let source_path = work_dir.join("source.mp4");
+
+    info!(%job_id, uri = %source_uri, "Fetching source video from object store");
+    ObjectStore::download_to_file(source_uri, store, &source_path)
+        .await
+        .context("failed to download source video")?;
+
+    // Real duration via ffprobe — the crude byte-size estimate this replaces
+    // was wrong by roughly 6x on the video that exposed this whole gap.
+    let probe = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(&source_path)
+        .output()
+        .await
+        .context("failed to run ffprobe")?;
+    if !probe.status.success() {
+        anyhow::bail!(
+            "ffprobe failed: {}",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+    }
+    let duration_secs: f64 = String::from_utf8_lossy(&probe.stdout)
+        .trim()
+        .parse()
+        .context("failed to parse ffprobe duration")?;
+
+    // Cut into fixed-duration chunks. `-f segment` snaps each boundary to
+    // the nearest keyframe, so actual segment lengths vary slightly from
+    // K8S_SEGMENT_DURATION_SECS — that's fine, we only need the total count
+    // and approximate per-segment timestamps for scheduling/logging.
+    let segment_pattern = work_dir.join("seg_%03d.ts");
+    let cut = Command::new("ffmpeg")
+        .args(["-y", "-i"])
+        .arg(&source_path)
+        .args([
+            "-c",
+            "copy",
+            "-map",
+            "0",
+            "-f",
+            "segment",
+            "-segment_time",
+            &K8S_SEGMENT_DURATION_SECS.to_string(),
+            "-reset_timestamps",
+            "1",
+        ])
+        .arg(&segment_pattern)
+        .output()
+        .await
+        .context("failed to run ffmpeg segment cut")?;
+    if !cut.status.success() {
+        anyhow::bail!(
+            "ffmpeg segment cut failed: {}",
+            String::from_utf8_lossy(&cut.stderr).trim()
+        );
+    }
+
+    let mut segment_files: Vec<PathBuf> = Vec::new();
+    let mut read_dir = tokio::fs::read_dir(&work_dir)
+        .await
+        .context("failed to read segment work dir")?;
+    while let Some(entry) = read_dir.next_entry().await? {
+        let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("seg_") && n.ends_with(".ts"))
+        {
+            segment_files.push(path);
+        }
+    }
+    segment_files.sort();
+    if segment_files.is_empty() {
+        anyhow::bail!("ffmpeg produced no segment files");
+    }
+
+    let fps_estimate = 30.0_f64;
+    let mut descriptors = Vec::with_capacity(segment_files.len());
+    for (i, path) in segment_files.iter().enumerate() {
+        let key = format!("jobs/{}/input/seg_{}.ts", job_id, i);
+        store
+            .upload_file(&key, path)
+            .await
+            .with_context(|| format!("failed to upload segment {} to {}", i, key))?;
+
+        let start = i as f64 * K8S_SEGMENT_DURATION_SECS;
+        let end = ((i + 1) as f64 * K8S_SEGMENT_DURATION_SECS).min(duration_secs);
+        let frames_in_segment = ((end - start) * fps_estimate).max(1.0) as u64;
+        descriptors.push(SegmentDescriptor {
+            id: i,
+            start_frame: 0,
+            end_frame: frames_in_segment,
+            start_timestamp: start,
+            end_timestamp: end,
+            lookahead_frames: Some(30),
+            complexity_estimate: 0.5,
+            scene_changes: vec![],
+        });
+    }
+
+    info!(
+        %job_id,
+        duration_secs,
+        segment_count = descriptors.len(),
+        "Segmented and uploaded source video"
+    );
+
+    // Best-effort cleanup — an emptyDir scratch volume, not worth failing
+    // the job over if this doesn't succeed.
+    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+    Ok(descriptors)
+}
+
+// ---------------------------------------------------------------------------
 // Worker process spawning
 // ---------------------------------------------------------------------------
 
@@ -984,18 +1189,28 @@ async fn spawn_worker(
         "LD_LIBRARY_PATH"
     };
 
+    // transcoder-worker takes the segment descriptor as one JSON blob (see
+    // worker/src/main.rs Args::segment), not discrete --segment-id/
+    // --start-frame/--end-frame flags — those don't exist on its CLI at
+    // all. --worker-id is required (no default). --presplit tells it to
+    // skip seek/timestamp-filtering logic, which is correct here: the
+    // input file it receives is always a single already-cut segment (via
+    // segment_and_upload's ffmpeg -f segment step, or the equivalent on
+    // the SRT/desktop path), never the full source video.
+    let segment_json = serde_json::to_string(&data.segment)
+        .context("failed to serialize segment descriptor")?;
+
     let mut cmd = Command::new(worker_binary);
     cmd.env(lib_path_key, lib_dir)
         .arg("--input")
         .arg(&input_path)
         .arg("--output")
         .arg(&output_path)
-        .arg("--segment-id")
-        .arg(data.segment.id.to_string())
-        .arg("--start-frame")
-        .arg(data.segment.start_frame.to_string())
-        .arg("--end-frame")
-        .arg(data.segment.end_frame.to_string())
+        .arg("--worker-id")
+        .arg("0")
+        .arg("--segment")
+        .arg(&segment_json)
+        .arg("--presplit")
         .arg("--crf")
         .arg(data.encoding_config.crf.to_string())
         .arg("--preset")

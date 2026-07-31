@@ -1,0 +1,29 @@
+# syntax=docker/dockerfile:1.6
+#
+# Web UI container — submits jobs to a transcoder cluster over the OpCode
+# WebSocket protocol. No FFmpeg/coordinator binary needed: cluster-mode job
+# submission (/api/cluster/*) talks directly to the cluster master over ws://,
+# it doesn't shell out locally. Local (non-cluster) transcode endpoints are
+# unavailable in this image since there's no coordinator binary here.
+#
+# Built for linux/arm64 (OKE A1.Flex nodes) via buildx:
+#   docker buildx build --platform linux/arm64 -t transcoder-web:dev .
+
+FROM node:20-slim AS deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+
+FROM node:20-slim AS runtime
+ENV NODE_ENV=production
+RUN useradd --system --home-dir /app --create-home --uid 10001 transcoder
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY package.json ./
+COPY web/server.js web/server.js
+COPY web/public web/public
+RUN mkdir -p web/uploads web/outputs && chown -R 10001:10001 /app
+USER 10001
+
+EXPOSE 3000
+CMD ["node", "web/server.js"]

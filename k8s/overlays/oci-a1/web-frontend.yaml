@@ -1,0 +1,113 @@
+# Web UI — deployed as a 4th "role" alongside the master + cpu-worker pods.
+# Runs on OKE Virtual Nodes (Pod.Standard.A1.Flex, serverless, billed per
+# pod — no per-VM "doubling up" cost concern here), still pinned via
+# required podAffinity to land on whichever node already runs a cpu-worker
+# pod purely to keep the grouping conceptually together.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: transcoder-web
+  labels:
+    app.kubernetes.io/name: transcoder-web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: transcoder-web
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: transcoder-web
+    spec:
+      imagePullSecrets:
+        - name: ocir-secret
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: transcoder-node
+                  pool: cpu-worker
+      containers:
+        - name: transcoder-web
+          image: transcoder-web:dev
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: PORT
+              value: "3000"
+            # In-cluster master Service — defaults the UI's cluster target so
+            # users don't have to type a ?master= address.
+            - name: CLUSTER_MASTER
+              value: "transcoder-master.transcoder.svc.cluster.local:9900"
+            # Same object store the cluster nodes use. Cluster-mode job
+            # submission uploads the raw source video here first — the
+            # master pod has no other way to reach a file that only exists
+            # on this pod's local disk.
+            - name: OBJECT_STORE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: transcoder-config
+                  key: object-store-url
+            - name: OBJECT_STORE_BUCKET
+              valueFrom:
+                configMapKeyRef:
+                  name: transcoder-config
+                  key: object-store-bucket
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: oci-s3-credentials
+                  key: access-key-id
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: oci-s3-credentials
+                  key: secret-access-key
+            - name: AWS_REGION
+              value: "us-ashburn-1"
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 3000
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+          # Virtual nodes require requests == limits (fixed pod-shape
+          # allocation, no bursting).
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "250m"
+              memory: "256Mi"
+---
+# ClusterIP only — external exposure is via the Native Ingress Controller
+# (web-ingress.yaml), since type:LoadBalancer registers an unreachable
+# NodePort backend against OKE Virtual Nodes (see web-ingress.yaml comment).
+apiVersion: v1
+kind: Service
+metadata:
+  name: transcoder-web
+  labels:
+    app.kubernetes.io/name: transcoder-web
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: transcoder-web
+  ports:
+    - name: http
+      port: 80
+      targetPort: 3000
+      protocol: TCP

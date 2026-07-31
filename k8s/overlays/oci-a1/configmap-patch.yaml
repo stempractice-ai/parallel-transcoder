@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: transcoder-config
+data:
+  object-store-url: "https://idr5qsmifndm.compat.objectstorage.us-ashburn-1.oraclecloud.com"
+  object-store-bucket: "transcoder-segments"
+  log-level: "info"

@@ -97,9 +97,15 @@ impl ObjectStore {
 
     /// Upload a local file to `s3://<bucket>/<key>`.
     pub async fn upload_file(&self, key: &str, path: &Path) -> Result<()> {
-        let body = ByteStream::from_path(path)
+        // ByteStream::from_path streams the body, which makes the SDK
+        // default to aws-chunked transfer encoding — OCI's S3-compat
+        // endpoint rejects that ("NotImplemented: AWS chunked encoding not
+        // supported"). Buffering avoids it entirely; segment files are only
+        // a few MB, so this is cheap.
+        let bytes = tokio::fs::read(path)
             .await
             .with_context(|| format!("failed to read {} for S3 upload", path.display()))?;
+        let body = ByteStream::from(bytes);
 
         self.client
             .put_object()
