@@ -527,6 +527,24 @@ app.post("/api/cluster/transcode", async (req, res) => {
 
   const jobId = crypto.randomUUID();
 
+  /** @type {JobState} */
+  const job = {
+    id: jobId,
+    status: "running",
+    process: null,
+    config: { uploadId, format, crf, preset, encoder, cluster: true },
+    outputDir: null,
+    logs: [],
+    phase: "starting",
+    percent: 0,
+    errorMessage: null,
+    createdAt: new Date(),
+    startedAt: new Date(),
+    segmentsCompleted: 0,
+    segmentsTotal: 0,
+  };
+  jobs.set(jobId, job);
+
   try {
     let srtInputUrl = null;
     if (s3Client) {
@@ -544,6 +562,10 @@ app.post("/api/cluster/transcode", async (req, res) => {
     });
     res.json({ jobId, master, status: "submitted", clusterId: result.jobId });
   } catch (err) {
+    job.status = "error";
+    job.phase = "error";
+    job.errorMessage = `Cluster submission failed: ${err.message}`;
+    broadcast(jobId, { type: "error", jobId, message: job.errorMessage });
     res.status(500).json({ error: `Cluster submission failed: ${err.message}` });
   }
 });
@@ -853,6 +875,46 @@ function submitClusterJob(master, { jobId, inputPath, format, crf, preset, encod
           clearTimeout(timer);
           ws.close();
           reject(new Error(msg.d.message || "Cluster error"));
+        } else if (msg.op === 32 && msg.d.job_id === jobId) {  // JobProgress
+          const job = jobs.get(jobId);
+          if (!job) return;
+          job.segmentsCompleted = msg.d.completed_segments;
+          job.segmentsTotal = msg.d.total_segments;
+          job.phase = "encoding";
+          job.percent = job.segmentsTotal > 0
+            ? Math.round((job.segmentsCompleted / job.segmentsTotal) * 100)
+            : job.percent;
+          broadcast(jobId, {
+            type: "progress",
+            jobId,
+            phase: job.phase,
+            percent: job.percent,
+            message: `${job.segmentsCompleted}/${job.segmentsTotal} segments complete`,
+            startedAt: job.startedAt,
+            now: Date.now(),
+            segmentsCompleted: job.segmentsCompleted,
+            segmentsTotal: job.segmentsTotal,
+          });
+        } else if (msg.op === 33 && msg.d.job_id === jobId) {  // JobComplete
+          const job = jobs.get(jobId);
+          if (job) {
+            job.status = "complete";
+            job.phase = "complete";
+            job.percent = 100;
+            job.segmentsTotal = msg.d.total_segments || job.segmentsTotal;
+            job.segmentsCompleted = job.segmentsTotal;
+            broadcast(jobId, { type: "complete", jobId, outputFiles: [] });
+          }
+          ws.close();
+        } else if (msg.op === 34 && msg.d.job_id === jobId) {  // JobFailed
+          const job = jobs.get(jobId);
+          if (job) {
+            job.status = "error";
+            job.phase = "error";
+            job.errorMessage = msg.d.error || "Cluster job failed";
+            broadcast(jobId, { type: "error", jobId, message: job.errorMessage });
+          }
+          ws.close();
         }
       } catch {
         // ignore malformed messages

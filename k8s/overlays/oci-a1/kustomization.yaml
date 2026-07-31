@@ -25,4 +25,4 @@ images:
     newTag: "v0.1.8"
   - name: transcoder-web
     newName: iad.ocir.io/idr5qsmifndm/transcoder-web
-    newTag: "v0.1.3"
+    newTag: "v0.1.4"
