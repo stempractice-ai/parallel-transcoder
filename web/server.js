@@ -10,7 +10,7 @@ import fsp from "fs/promises";
 import { fileURLToPath } from "url";
 import http from "http";
 import https from "https";
-import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const RESOURCES_DIR = process.env.TRANSCODER_RESOURCES_DIR || path.join(__dirname, "..");
@@ -58,6 +58,40 @@ async function uploadSourceToObjectStore(jobId, inputPath) {
     Body: body,
   }));
   return `s3://${OBJECT_STORE_BUCKET}/${key}`;
+}
+
+/** Download an s3://bucket/key object to a local path. */
+async function downloadFromObjectStore(uri, destPath) {
+  const match = uri.match(/^s3:\/\/([^/]+)\/(.+)$/);
+  if (!match) throw new Error(`Not an s3:// URI: ${uri}`);
+  const [, bucket, key] = match;
+  const resp = await s3Client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+  const bytes = await resp.Body.transformToByteArray();
+  await fsp.writeFile(destPath, bytes);
+}
+
+/**
+ * Fetch a completed cluster job's assembled output (if the master produced
+ * one) into the job's local output dir so it's downloadable through the
+ * same /api/download path local jobs already use.
+ */
+async function finalizeClusterJob(jobId, job, outputUri) {
+  if (!outputUri || !s3Client) {
+    broadcast(jobId, { type: "complete", jobId, outputFiles: [] });
+    return;
+  }
+  try {
+    const jobOutputDir = path.join(OUTPUT_DIR, jobId);
+    await fsp.mkdir(jobOutputDir, { recursive: true });
+    const destPath = path.join(jobOutputDir, "output.mp4");
+    await downloadFromObjectStore(outputUri, destPath);
+    job.outputDir = jobOutputDir;
+    const stat = await fsp.stat(destPath);
+    broadcast(jobId, { type: "complete", jobId, outputFiles: [{ name: "output.mp4", size: stat.size }] });
+  } catch (err) {
+    console.error(`Failed to fetch assembled output for job ${jobId}:`, err.message);
+    broadcast(jobId, { type: "complete", jobId, outputFiles: [] });
+  }
 }
 
 /** Resolve cluster master from request (query/body), falling back to env default. */
@@ -403,6 +437,28 @@ app.get("/api/jobs", (_req, res) => {
     list.push(jobSummary(job));
   }
   res.json(list);
+});
+
+// Delete all jobs and their stored files (uploaded source + output dir)
+app.delete("/api/jobs", async (_req, res) => {
+  let count = 0;
+  for (const job of jobs.values()) {
+    if (job.process) {
+      job.process.kill("SIGTERM");
+      job.process = null;
+    }
+    if (job.outputDir) {
+      fsp.rm(job.outputDir, { recursive: true, force: true }).catch(() => {});
+    }
+    if (job.config && job.config.uploadId) {
+      const srcPath = path.join(UPLOAD_DIR, path.basename(job.config.uploadId));
+      fsp.rm(srcPath, { force: true }).catch(() => {});
+    }
+    subscribers.delete(job.id);
+    count++;
+  }
+  jobs.clear();
+  res.json({ deleted: count });
 });
 
 // Single job
@@ -903,7 +959,7 @@ function submitClusterJob(master, { jobId, inputPath, format, crf, preset, encod
             job.percent = 100;
             job.segmentsTotal = msg.d.total_segments || job.segmentsTotal;
             job.segmentsCompleted = job.segmentsTotal;
-            broadcast(jobId, { type: "complete", jobId, outputFiles: [] });
+            finalizeClusterJob(jobId, job, msg.d.output_uri);
           }
           ws.close();
         } else if (msg.op === 34 && msg.d.job_id === jobId) {  // JobFailed

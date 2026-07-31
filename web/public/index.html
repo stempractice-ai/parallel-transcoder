@@ -2040,7 +2040,10 @@ body::before {
       </section>
 
       <div class="jobs-section" id="jobsSection">
-        <div class="jobs-heading">Active Jobs</div>
+        <div class="jobs-heading">
+          Active Jobs
+          <button class="btn-cancel" id="btnClearJobs" style="margin-left:auto;">Clear All</button>
+        </div>
         <div class="jobs-list" id="jobsList"></div>
       </div>
 
@@ -2167,6 +2170,13 @@ body::before {
     cancelJob: function(id) {
       return fetch('/api/jobs/' + encodeURIComponent(id), { method: 'DELETE' }).then(function(r) {
         if (!r.ok) throw new Error('Failed to cancel');
+        return r.json();
+      });
+    },
+
+    clearJobs: function() {
+      return fetch('/api/jobs', { method: 'DELETE' }).then(function(r) {
+        if (!r.ok) throw new Error('Failed to clear jobs');
         return r.json();
       });
     },
@@ -2363,7 +2373,7 @@ body::before {
         'uploadZone', 'uploadBtn', 'fileInput', 'fileInfo', 'fileName', 'fileSize',
         'uploadProgress', 'uploadProgressFill', 'uploadProgressText', 'urlInput', 'urlImportBtn',
         'optMode', 'optTolerance', 'toleranceValue', 'grpTolerance', 'grpCrf', 'grpPreset', 'grpEncoder',
-        'btnAnalyze', 'btnTranscode', 'wsDot', 'wsLabel',
+        'btnAnalyze', 'btnTranscode', 'btnClearJobs', 'wsDot', 'wsLabel',
         'analysisView', 'jobsSection', 'jobsList', 'mainContent', 'emptyState'
       ];
       ids.forEach(function(id) { UI.els[id] = document.getElementById(id); });
@@ -2414,6 +2424,7 @@ body::before {
 
       UI.els.btnAnalyze.addEventListener('click', function() { App.analyze(); });
       UI.els.btnTranscode.addEventListener('click', function() { App.transcode(); });
+      UI.els.btnClearJobs.addEventListener('click', function() { App.clearAllJobs(); });
 
       UI.syncSettings();
     },
@@ -3378,8 +3389,8 @@ body::before {
           startedAt: Date.now(), outputFiles: [], cluster: useCluster
         });
         UI.createJobCard(jobId);
-        if (!useCluster) WS.subscribe(jobId);
-        else Cluster.refreshNodes();
+        WS.subscribe(jobId);
+        if (useCluster) Cluster.refreshNodes();
       }).catch(function(err) {
         UI.setBtnLoading(UI.els.btnTranscode, false);
         console.error('Transcode error:', err);
@@ -3395,6 +3406,21 @@ body::before {
         WS.subs.delete(jobId);
         UI.updateJob(jobId);
       }).catch(function(err) { console.error('Cancel error:', err); });
+    },
+
+    clearAllJobs: function() {
+      if (App.jobs.size === 0) return;
+      if (!confirm('Remove all jobs and delete their stored files? This cannot be undone.')) return;
+      API.clearJobs().then(function() {
+        App.jobs.forEach(function(job, jobId) { WS.subs.delete(jobId); });
+        App.jobs.clear();
+        UI.els.jobsList.innerHTML = '';
+        UI.els.jobsSection.classList.remove('visible');
+        UI.updateEmpty();
+      }).catch(function(err) {
+        console.error('Clear jobs error:', err);
+        alert('Failed to clear jobs: ' + err.message);
+      });
     }
   };
 

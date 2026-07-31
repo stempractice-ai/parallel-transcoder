@@ -119,6 +119,10 @@ struct JobContext {
     config: EncodingConfig,
     input_filename: String,
     segments: Vec<SegmentDescriptor>,
+    /// segment_id -> object-store URI of its encoded output, filled in as
+    /// SegmentComplete messages arrive. Used to assemble the final output
+    /// once every segment is done.
+    output_uris: HashMap<usize, String>,
 }
 
 /// Top-level application state shared across the event loop.
@@ -137,6 +141,8 @@ struct App {
     local_workers: HashMap<usize, mpsc::Sender<()>>,
     /// Pending worker results waiting to be relayed to the master.
     pending_results: HashMap<usize, (mpsc::UnboundedReceiver<ResultMessage>, SocketAddr)>,
+    /// Final-output assembly tasks in flight (job_id -> result channel).
+    pending_assembly: HashMap<JobId, mpsc::UnboundedReceiver<AssemblyResult>>,
     /// CLI configuration.
     worker_binary: PathBuf,
     lib_dir: PathBuf,
@@ -168,6 +174,7 @@ impl App {
             job_contexts: HashMap::new(),
             local_workers: HashMap::new(),
             pending_results: HashMap::new(),
+            pending_assembly: HashMap::new(),
             worker_binary,
             lib_dir,
             object_store,
@@ -478,6 +485,7 @@ impl App {
                 config: data.config,
                 input_filename: data.input_filename,
                 segments: segments.clone(),
+                output_uris: HashMap::new(),
             },
         );
 
@@ -752,6 +760,12 @@ impl App {
         );
 
         let job_id = data.job_id;
+        if is_s3_uri(&data.srt_output_url) {
+            if let Some(ctx) = self.job_contexts.get_mut(&job_id) {
+                ctx.output_uris
+                    .insert(data.result.segment_id, data.srt_output_url.clone());
+            }
+        }
         self.scheduler.mark_complete(&job_id, data.result);
         self.check_job_completion(job_id);
     }
@@ -810,18 +824,90 @@ impl App {
             if let Ok(msg) = Message::new(OpCode::JobFailed, &fail_data) {
                 self.transport.broadcast(&msg, None);
             }
-        } else {
-            info!(%job_id, completed, total, "Job completed successfully");
-            let complete_data = serde_json::json!({
-                "job_id": job_id,
-                "total_segments": total,
-            });
-            if let Ok(msg) = Message::new(OpCode::JobComplete, &complete_data) {
-                self.transport.broadcast(&msg, None);
+            self.job_contexts.remove(&job_id);
+            return;
+        }
+
+        let ctx = self.job_contexts.remove(&job_id);
+        let uris: Vec<(usize, String)> = ctx
+            .as_ref()
+            .map(|c| c.output_uris.clone().into_iter().collect())
+            .unwrap_or_default();
+
+        // If every segment's encoded output landed in the object store,
+        // assemble the final file before telling the submitter the job is
+        // done. Without an object store (SRT-only deployments) there's
+        // nowhere shared to assemble into, so fall back to the old
+        // segments-only completion signal.
+        if let (Some(store), Some(ctx)) = (self.object_store.clone(), ctx.as_ref()) {
+            if uris.len() == total {
+                info!(%job_id, completed, total, "Job segments complete, assembling final output");
+                let (tx, rx) = mpsc::unbounded_channel();
+                self.pending_assembly.insert(job_id, rx);
+                let format = ctx.config.format.clone();
+                tokio::spawn(async move {
+                    let outcome = assemble_output(&store, job_id, &format, uris).await;
+                    let _ = tx.send(AssemblyResult {
+                        total_segments: total,
+                        outcome,
+                    });
+                });
+                return;
             }
         }
 
-        self.job_contexts.remove(&job_id);
+        info!(%job_id, completed, total, "Job completed successfully");
+        let complete_data = serde_json::json!({
+            "job_id": job_id,
+            "total_segments": total,
+            "output_uri": null,
+        });
+        if let Ok(msg) = Message::new(OpCode::JobComplete, &complete_data) {
+            self.transport.broadcast(&msg, None);
+        }
+    }
+
+    /// Poll in-flight final-output assembly tasks and broadcast the result
+    /// once each finishes.
+    fn poll_assembly_results(&mut self) {
+        let mut done = Vec::new();
+
+        for (&job_id, rx) in &mut self.pending_assembly {
+            match rx.try_recv() {
+                Ok(result) => {
+                    match result.outcome {
+                        Ok(output_uri) => {
+                            info!(%job_id, %output_uri, "Job completed successfully");
+                            let complete_data = serde_json::json!({
+                                "job_id": job_id,
+                                "total_segments": result.total_segments,
+                                "output_uri": output_uri,
+                            });
+                            if let Ok(msg) = Message::new(OpCode::JobComplete, &complete_data) {
+                                self.transport.broadcast(&msg, None);
+                            }
+                        }
+                        Err(e) => {
+                            warn!(%job_id, error = ?e, "Failed to assemble final output");
+                            let fail_data = serde_json::json!({
+                                "job_id": job_id,
+                                "error": format!("Failed to assemble final output: {:?}", e),
+                            });
+                            if let Ok(msg) = Message::new(OpCode::JobFailed, &fail_data) {
+                                self.transport.broadcast(&msg, None);
+                            }
+                        }
+                    }
+                    done.push(job_id);
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {}
+                Err(mpsc::error::TryRecvError::Disconnected) => done.push(job_id),
+            }
+        }
+
+        for job_id in done {
+            self.pending_assembly.remove(&job_id);
+        }
     }
 
     // ====================================================================
@@ -953,6 +1039,67 @@ struct ResultMessage {
 struct WorkerOutcome {
     result: SegmentResult,
     output_uri: Option<String>,
+}
+
+/// Result of assembling a job's per-segment outputs into a final file.
+struct AssemblyResult {
+    total_segments: usize,
+    outcome: Result<String>,
+}
+
+/// Download every segment's encoded output, concatenate them via ffmpeg's
+/// concat demuxer (stream copy — segments share the same codec/settings
+/// since one job encodes all of them with the same config), and upload the
+/// assembled file back to the object store.
+///
+/// Always produces an MP4 container regardless of the job's requested
+/// `format` — HLS assembly (playlist + segment files) isn't implemented.
+async fn assemble_output(
+    store: &ObjectStore,
+    job_id: JobId,
+    _format: &str,
+    mut uris: Vec<(usize, String)>,
+) -> Result<String> {
+    use tokio::process::Command;
+
+    uris.sort_by_key(|(id, _)| *id);
+
+    let work_dir = std::env::temp_dir().join(format!("transcoder-assemble-{}", job_id));
+    tokio::fs::create_dir_all(&work_dir).await?;
+
+    let mut list_lines = String::new();
+    for (id, uri) in &uris {
+        let seg_path = work_dir.join(format!("seg_{}.ts", id));
+        ObjectStore::download_to_file(uri, store, &seg_path)
+            .await
+            .with_context(|| format!("failed to download segment output {}", uri))?;
+        list_lines.push_str(&format!("file '{}'\n", seg_path.display()));
+    }
+    let list_path = work_dir.join("concat.txt");
+    tokio::fs::write(&list_path, list_lines).await?;
+
+    let output_path = work_dir.join("output.mp4");
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-f", "concat", "-safe", "0", "-i"])
+        .arg(&list_path)
+        .args(["-c", "copy"])
+        .arg(&output_path)
+        .status()
+        .await
+        .context("failed to run ffmpeg concat")?;
+    if !status.success() {
+        anyhow::bail!("ffmpeg concat exited with {:?}", status.code());
+    }
+
+    let out_key = format!("jobs/{}/final/output.mp4", job_id);
+    store
+        .upload_file(&out_key, &output_path)
+        .await
+        .context("failed to upload assembled output")?;
+
+    tokio::fs::remove_dir_all(&work_dir).await.ok();
+
+    Ok(store.build_uri(&out_key))
 }
 
 // ---------------------------------------------------------------------------
@@ -1527,6 +1674,7 @@ async fn main() -> Result<()> {
             _ = schedule_tick.tick() => {
                 app.run_scheduler();
                 app.poll_worker_results();
+                app.poll_assembly_results();
             }
 
             // Graceful shutdown on Ctrl+C.

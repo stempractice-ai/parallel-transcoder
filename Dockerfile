@@ -71,6 +71,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       pkg-config \
       clang \
       libssl-dev \
+      libx264-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Pull the FFmpeg artifacts we just built — same layout the upstream image

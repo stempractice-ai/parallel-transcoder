@@ -175,6 +175,34 @@ fn receive_and_write(
     Ok(())
 }
 
+/// Stream-copy one audio packet from input to output — no decode/re-encode,
+/// just timestamp rescaling and remuxing onto the output audio stream.
+/// Outside presplit mode, packets outside the segment's time window are
+/// dropped to match the video path's frame filtering.
+fn copy_audio_packet(
+    mut packet: ffmpeg::Packet,
+    input_tb: Rational,
+    output_stream_index: usize,
+    presplit: bool,
+    segment: &SegmentDescriptor,
+    octx: &mut format::context::Output,
+) -> Result<()> {
+    if !presplit {
+        if let Some(pts) = packet.pts() {
+            let pts_secs =
+                pts as f64 * input_tb.numerator() as f64 / input_tb.denominator() as f64;
+            if pts_secs < segment.start_timestamp - 0.001 || pts_secs > segment.end_timestamp + 0.001 {
+                return Ok(());
+            }
+        }
+    }
+    let output_tb = octx.stream(output_stream_index).unwrap().time_base();
+    packet.rescale_ts(input_tb, output_tb);
+    packet.set_stream(output_stream_index);
+    packet.write_interleaved(octx)?;
+    Ok(())
+}
+
 fn transcode_segment(
     args: &Args,
     segment: &SegmentDescriptor,
@@ -439,6 +467,40 @@ fn transcode_segment(
 
     let encoder_tb = opened_encoder.time_base();
 
+    // --- Optional audio passthrough (stream copy, no re-encode) ---
+    // (index_in, time_base_in, index_out), or None if the source has no
+    // audio track or the muxer has no matching codec support for it.
+    let audio_info: Option<(usize, Rational, usize)> = {
+        match ictx.streams().best(Type::Audio) {
+            Some(a_stream) => {
+                let a_index = a_stream.index();
+                let a_tb = a_stream.time_base();
+                let params = a_stream.parameters();
+                match ffmpeg::encoder::find(params.id()) {
+                    Some(audio_codec) => {
+                        let mut aost = octx
+                            .add_stream(audio_codec)
+                            .context("Failed to add output audio stream")?;
+                        aost.set_parameters(params);
+                        // Standard remux gotcha: a stale codec_tag from the
+                        // source container can confuse the target muxer.
+                        unsafe {
+                            (*aost.parameters().as_mut_ptr()).codec_tag = 0;
+                        }
+                        let out_index = aost.index();
+                        info!("Audio passthrough: input stream {} -> output stream {}", a_index, out_index);
+                        Some((a_index, a_tb, out_index))
+                    }
+                    None => {
+                        warn!("No muxer support for input audio codec, dropping audio track");
+                        None
+                    }
+                }
+            }
+            None => None,
+        }
+    };
+
     octx.write_header().context("Failed to write output header")?;
 
     // Re-read output_tb after write_header (muxer may change it)
@@ -494,7 +556,13 @@ fn transcode_segment(
     };
 
     for (stream, packet) in ictx.packets() {
-        if stream.index() != video_stream_index {
+        let stream_index = stream.index();
+        if stream_index != video_stream_index {
+            if let Some((audio_index, audio_tb, audio_out_index)) = audio_info {
+                if stream_index == audio_index {
+                    copy_audio_packet(packet, audio_tb, audio_out_index, presplit, segment, &mut octx)?;
+                }
+            }
             continue;
         }
 
