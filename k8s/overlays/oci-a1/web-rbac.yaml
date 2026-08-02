@@ -1,0 +1,32 @@
+# Lets transcoder-web scale the transcoder-worker-cpu Deployment from the
+# browser UI (Start/Stop Workers) without bundling kubectl in the web image —
+# the server talks to the in-cluster API server directly using this
+# ServiceAccount's mounted token. Scoped to just the scale subresource of
+# the one named Deployment, nothing else — deliberately does NOT cover the
+# transcoder-node master StatefulSet, which must keep running.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: transcoder-web
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: transcoder-web-scale-workers
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    resourceNames: ["transcoder-worker-cpu"]
+    verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: transcoder-web-scale-workers
+subjects:
+  - kind: ServiceAccount
+    name: transcoder-web
+roleRef:
+  kind: Role
+  name: transcoder-web-scale-workers
+  apiGroup: rbac.authorization.k8s.io

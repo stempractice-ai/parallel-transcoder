@@ -44,6 +44,117 @@ const s3Client = OBJECT_STORE_URL
     })
   : null;
 
+// In-cluster Kubernetes API access (worker pod scaling). Only usable when
+// this server itself runs as a pod with a mounted ServiceAccount token —
+// i.e. real k8s deployments (OCI, kind), never local/desktop mode. Talks to
+// the target object's /scale subresource directly over HTTPS so the image
+// doesn't need a bundled kubectl binary.
+//
+// The worker topology differs by overlay: the kind dev overlay bakes master
+// (ordinal 0) + workers into one StatefulSet, so scaling down must stop at
+// 1. The OCI overlay runs workers as their own Deployment
+// (transcoder-worker-cpu) separate from the master StatefulSet, so it can
+// scale all the way to 0. K8S_WORKER_KIND/NAME point at whichever object
+// this deployment actually uses; K8S_WORKER_MIN_REPLICAS defaults per-kind
+// but can be overridden explicitly.
+const K8S_SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount";
+const K8S_TOKEN_PATH = path.join(K8S_SA_DIR, "token");
+const K8S_CA_PATH = path.join(K8S_SA_DIR, "ca.crt");
+const K8S_NAMESPACE_PATH = path.join(K8S_SA_DIR, "namespace");
+const K8S_WORKER_KIND = (process.env.K8S_WORKER_KIND || "statefulsets").toLowerCase();
+const K8S_WORKER_NAME = process.env.K8S_WORKER_NAME || "transcoder-node";
+const K8S_WORKER_MIN_REPLICAS = process.env.K8S_WORKER_MIN_REPLICAS != null
+  ? Number(process.env.K8S_WORKER_MIN_REPLICAS)
+  : (K8S_WORKER_KIND === "statefulsets" ? 1 : 0);
+const K8S_AVAILABLE = !!process.env.KUBERNETES_SERVICE_HOST
+  && fs.existsSync(K8S_TOKEN_PATH) && fs.existsSync(K8S_CA_PATH);
+const K8S_NAMESPACE = K8S_AVAILABLE && fs.existsSync(K8S_NAMESPACE_PATH)
+  ? fs.readFileSync(K8S_NAMESPACE_PATH, "utf8").trim()
+  : "default";
+
+/** Issue an authenticated request against the in-cluster Kubernetes API server. */
+function k8sRequest(method, apiPath, body) {
+  return new Promise((resolve, reject) => {
+    if (!K8S_AVAILABLE) {
+      return reject(new Error("Kubernetes API not available (not running in-cluster)"));
+    }
+    let token, ca;
+    try {
+      token = fs.readFileSync(K8S_TOKEN_PATH, "utf8").trim();
+      ca = fs.readFileSync(K8S_CA_PATH);
+    } catch (err) {
+      return reject(err);
+    }
+    const payload = body ? Buffer.from(JSON.stringify(body)) : null;
+    const req = https.request({
+      host: process.env.KUBERNETES_SERVICE_HOST,
+      port: process.env.KUBERNETES_SERVICE_PORT || "443",
+      path: apiPath,
+      method,
+      ca,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/json",
+        ...(payload ? {
+          "Content-Type": "application/merge-patch+json",
+          "Content-Length": payload.length,
+        } : {}),
+      },
+    }, (res) => {
+      let data = "";
+      res.on("data", (chunk) => { data += chunk; });
+      res.on("end", () => {
+        let parsed = null;
+        try { parsed = data ? JSON.parse(data) : null; } catch { /* non-JSON error body */ }
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          resolve(parsed);
+        } else {
+          reject(new Error((parsed && parsed.message) || `Kubernetes API returned ${res.statusCode}`));
+        }
+      });
+    });
+    req.on("error", reject);
+    if (payload) req.write(payload);
+    req.end();
+  });
+}
+
+function validateWorkerReplicas(replicas) {
+  const n = Number(replicas);
+  if (!Number.isFinite(n) || n < K8S_WORKER_MIN_REPLICAS || n > 50 || Math.floor(n) !== n) {
+    throw new Error(`replicas must be an integer between ${K8S_WORKER_MIN_REPLICAS} and 50`);
+  }
+  return n;
+}
+
+function workerScalePath() {
+  return `/apis/apps/v1/namespaces/${K8S_NAMESPACE}/${K8S_WORKER_KIND}/${K8S_WORKER_NAME}/scale`;
+}
+
+/**
+ * Current desired/current replica counts for the worker StatefulSet/Deployment.
+ * The scale subresource's status.replicas is the *total* pod count the
+ * controller currently reports (may still be starting up) — not a readiness
+ * count, which isn't exposed on this subresource.
+ */
+async function getWorkerReplicas() {
+  const scale = await k8sRequest("GET", workerScalePath());
+  // Kubernetes' Go JSON encoding elides int fields at their zero value
+  // (`omitempty`), so spec.replicas/status.replicas are simply absent from
+  // the response when scaled to 0 — not present-and-0. Default explicitly.
+  return {
+    replicas: scale.spec.replicas ?? 0,
+    currentReplicas: scale.status.replicas ?? 0,
+  };
+}
+
+/** Scale worker pods to exactly `replicas` (never below K8S_WORKER_MIN_REPLICAS). */
+async function scaleWorkers(replicas) {
+  const n = validateWorkerReplicas(replicas);
+  await k8sRequest("PATCH", workerScalePath(), { spec: { replicas: n } });
+  return n;
+}
+
 /** Upload the local source file to the object store; returns an s3:// URI. */
 async function uploadSourceToObjectStore(jobId, inputPath) {
   const key = `jobs/${jobId}/source/${path.basename(inputPath)}`;
@@ -623,6 +734,36 @@ app.post("/api/cluster/transcode", async (req, res) => {
     job.errorMessage = `Cluster submission failed: ${err.message}`;
     broadcast(jobId, { type: "error", jobId, message: job.errorMessage });
     res.status(500).json({ error: `Cluster submission failed: ${err.message}` });
+  }
+});
+
+// Worker pod scaling status (k8s-only — used to show/hide Start/Stop Workers in the UI)
+app.get("/api/cluster/workers", async (_req, res) => {
+  if (!K8S_AVAILABLE) return res.json({ available: false });
+  try {
+    const { replicas, currentReplicas } = await getWorkerReplicas();
+    res.json({
+      available: true,
+      replicas,
+      currentReplicas,
+      minReplicas: K8S_WORKER_MIN_REPLICAS,
+      kind: K8S_WORKER_KIND,
+      name: K8S_WORKER_NAME,
+      namespace: K8S_NAMESPACE,
+    });
+  } catch (err) {
+    res.status(503).json({ available: false, error: err.message });
+  }
+});
+
+// Scale worker pods up/down to preserve cost when idle
+app.post("/api/cluster/workers/scale", async (req, res) => {
+  if (!K8S_AVAILABLE) return res.status(503).json({ error: "Kubernetes API not available" });
+  try {
+    const n = await scaleWorkers(req.body && req.body.replicas);
+    res.json({ ok: true, replicas: n });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
   }
 });
 

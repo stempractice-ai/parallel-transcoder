@@ -8,6 +8,7 @@ resources:
   - worker-cpu.yaml
   - web-frontend.yaml
   - web-ingress.yaml
+  - web-rbac.yaml
 
 patches:
   - path: master-patch.yaml
@@ -25,4 +26,4 @@ images:
     newTag: "v0.1.10"
   - name: transcoder-web
     newName: iad.ocir.io/idr5qsmifndm/transcoder-web
-    newTag: "v0.1.6"
+    newTag: "v0.1.11"

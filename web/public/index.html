@@ -1937,6 +1937,16 @@ body::before {
             <span class="cluster-dot" id="clusterDot"></span>
             <span id="clusterStatusText">Not connected</span>
           </div>
+          <div id="clusterWorkersBlock" style="display:none">
+            <div class="cluster-master-line">
+              <span class="cluster-master-label">Workers</span>
+              <span id="clusterWorkersText">—</span>
+            </div>
+            <div class="cluster-action-row" style="margin-top:0">
+              <button class="btn-start" id="btnWorkersStart" type="button" disabled>Start Workers</button>
+              <button class="btn-stop" id="btnWorkersStop" type="button" disabled>Stop Workers</button>
+            </div>
+          </div>
         </div>
 
         <!-- Off pane -->
@@ -1991,6 +2001,14 @@ body::before {
             <div class="cluster-pane-row-input">
               <input type="number" id="k8sReplicas" min="1" max="50" step="1" value="3">
               <button class="url-import-btn" id="btnK8sScale" type="button" disabled>Scale</button>
+            </div>
+          </div>
+
+          <div class="cluster-pane-row">
+            <label class="field-label">Worker pods</label>
+            <div class="cluster-action-row" style="margin-top:0">
+              <button class="btn-start" id="btnK8sStartWorkers" type="button" disabled>Start Workers</button>
+              <button class="btn-stop" id="btnK8sStopWorkers" type="button" disabled>Stop Workers</button>
             </div>
           </div>
 
@@ -2209,6 +2227,21 @@ body::before {
         body: JSON.stringify(body)
       }).then(function(r) {
         if (!r.ok) return r.json().then(function(d) { throw new Error(d.error || ('Cluster submit failed: ' + r.status)); });
+        return r.json();
+      });
+    },
+
+    workersStatus: function() {
+      return fetch('/api/cluster/workers').then(function(r) { return r.json(); });
+    },
+
+    workersScale: function(replicas) {
+      return fetch('/api/cluster/workers/scale', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ replicas: replicas })
+      }).then(function(r) {
+        if (!r.ok) return r.json().then(function(d) { throw new Error(d.error || ('Scale failed: ' + r.status)); });
         return r.json();
       });
     }
@@ -2792,6 +2825,8 @@ body::before {
       busy: null,
       portForwardActive: false,
       pollTimer: null,
+      replicas: null,
+      clusterExists: false,
     },
 
     get useCluster() { return Cluster.mode !== 'off' && !!Cluster.master; },
@@ -2808,7 +2843,8 @@ body::before {
         'clusterMaster', 'clusterConnectBtn',
         // k8s pane
         'k8sTools', 'k8sStatusText', 'btnK8sCreate', 'btnK8sDelete', 'k8sSkipBuild',
-        'k8sReplicas', 'btnK8sScale', 'k8sPfPort', 'btnK8sPfStart', 'btnK8sPfStop',
+        'k8sReplicas', 'btnK8sScale', 'btnK8sStartWorkers', 'btnK8sStopWorkers',
+        'k8sPfPort', 'btnK8sPfStart', 'btnK8sPfStop',
         // right-panel cards
         'clusterCard', 'clusterCardDot', 'clusterCardMeta', 'nodesTableWrap',
         'k8sCard', 'k8sCardDot', 'k8sCardMeta', 'k8sPodsWrap', 'k8sLog'
@@ -2861,6 +2897,8 @@ body::before {
         Cluster.els.btnK8sCreate.addEventListener('click', Cluster.onK8sCreate);
         Cluster.els.btnK8sDelete.addEventListener('click', Cluster.onK8sDelete);
         Cluster.els.btnK8sScale.addEventListener('click', Cluster.onK8sScale);
+        Cluster.els.btnK8sStartWorkers.addEventListener('click', Cluster.onK8sStartWorkers);
+        Cluster.els.btnK8sStopWorkers.addEventListener('click', Cluster.onK8sStopWorkers);
         Cluster.els.btnK8sPfStart.addEventListener('click', Cluster.onK8sPfStart);
         Cluster.els.btnK8sPfStop.addEventListener('click', Cluster.onK8sPfStop);
         window.desktop.k8s.onLog(Cluster.appendK8sLog);
@@ -3077,6 +3115,8 @@ body::before {
           return;
         }
         Cluster.k8s.busy = r.busy || null;
+        Cluster.k8s.clusterExists = !!r.clusterExists;
+        Cluster.k8s.replicas = (r.replicas != null) ? r.replicas : null;
         Cluster.renderK8sTools(r.tools);
         Cluster.applyK8sBusyUI();
         if (!r.tools || !r.tools.kind || !r.tools.kubectl || !r.tools.docker) {
@@ -3124,9 +3164,13 @@ body::before {
 
     applyK8sBusyUI: function() {
       var busy = !!Cluster.k8s.busy;
+      var exists = !!Cluster.k8s.clusterExists;
+      var replicas = Cluster.k8s.replicas;
       Cluster.els.btnK8sCreate.disabled = busy;
       Cluster.els.btnK8sDelete.disabled = busy;
       Cluster.els.btnK8sScale.disabled  = busy;
+      Cluster.els.btnK8sStopWorkers.disabled  = busy || !exists || replicas == null || replicas <= 1;
+      Cluster.els.btnK8sStartWorkers.disabled = busy || !exists || replicas == null || replicas > 1;
       Cluster.els.btnK8sPfStart.disabled = busy ||  Cluster.k8s.portForwardActive;
       Cluster.els.btnK8sPfStop.disabled  = busy || !Cluster.k8s.portForwardActive;
       if (busy) Cluster.setK8sStatus(null, Cluster.k8s.busy + '\u2026');
@@ -3213,6 +3257,29 @@ body::before {
       });
     },
 
+    // Scale down to just the master (ordinal 0) to stop billing/compute for
+    // idle worker pods, remembering the current count so Start can restore it.
+    onK8sStopWorkers: function() {
+      var current = Cluster.k8s.replicas;
+      if (current != null && current > 1) {
+        try { localStorage.setItem('k8s.lastWorkerReplicas', String(current)); } catch (e) {}
+      }
+      window.desktop.k8s.scale(1).then(function(r) {
+        if (!r || !r.ok) alert('Stop workers failed: ' + ((r && r.error) || 'unknown'));
+        Cluster.refreshK8s();
+      });
+    },
+
+    onK8sStartWorkers: function() {
+      var saved = null;
+      try { saved = parseInt(localStorage.getItem('k8s.lastWorkerReplicas'), 10); } catch (e) {}
+      var n = Number.isFinite(saved) && saved > 1 ? saved : (parseInt(Cluster.els.k8sReplicas.value, 10) || 3);
+      window.desktop.k8s.scale(n).then(function(r) {
+        if (!r || !r.ok) alert('Start workers failed: ' + ((r && r.error) || 'unknown'));
+        Cluster.refreshK8s();
+      });
+    },
+
     onK8sPfStart: function() {
       var port = parseInt(Cluster.els.k8sPfPort.value, 10) || 9900;
       window.desktop.k8s.portForwardStart(port).then(function(r) {
@@ -3234,6 +3301,89 @@ body::before {
     }
   };
 
+  /* ==================================================================
+   * Worker pod scaling — server-side proxy to the Kubernetes scale API.
+   * Distinct from Cluster.k8s (desktop-only, drives a local kind cluster
+   * via shell-outs): this hits /api/cluster/workers on whatever server is
+   * serving this page, so it also works from a plain browser against a
+   * live deployment (e.g. the OCI cluster this page might itself be
+   * running on). Hidden entirely unless the server reports it's running
+   * in-cluster with scale permissions.
+   * ================================================================== */
+  var Workers = {
+    els: {},
+    pollTimer: null,
+    busy: false,
+    replicas: null,
+    minReplicas: 1,
+
+    init: function() {
+      this.els.block = document.getElementById('clusterWorkersBlock');
+      this.els.text = document.getElementById('clusterWorkersText');
+      this.els.start = document.getElementById('btnWorkersStart');
+      this.els.stop = document.getElementById('btnWorkersStop');
+      this.els.start.addEventListener('click', this.onStart.bind(this));
+      this.els.stop.addEventListener('click', this.onStop.bind(this));
+
+      var self = this;
+      API.workersStatus().then(function(d) {
+        if (!d || !d.available) return;
+        self.els.block.style.display = '';
+        self.refresh();
+        self.pollTimer = setInterval(self.refresh.bind(self), 5000);
+      }).catch(function() {});
+    },
+
+    refresh: function() {
+      var self = this;
+      API.workersStatus().then(function(d) {
+        if (!d || !d.available) return;
+        self.replicas = d.replicas;
+        if (d.minReplicas != null) self.minReplicas = d.minReplicas;
+        var current = d.currentReplicas != null ? d.currentReplicas : '?';
+        self.els.text.textContent = current + ' / ' + d.replicas + ' desired';
+        self.render();
+      }).catch(function() {});
+    },
+
+    render: function() {
+      var busy = this.busy;
+      var r = this.replicas;
+      var min = this.minReplicas;
+      this.els.stop.disabled  = busy || r == null || r <= min;
+      this.els.start.disabled = busy || r == null || r > min;
+    },
+
+    scaleTo: function(n, failLabel) {
+      var self = this;
+      this.busy = true;
+      this.render();
+      API.workersScale(n).catch(function(err) {
+        alert(failLabel + ': ' + err.message);
+      }).then(function() {
+        self.busy = false;
+        self.refresh();
+      });
+    },
+
+    // Scale down to the floor (0 for a standalone worker Deployment, 1 if
+    // master + workers share a StatefulSet) to stop billing/compute for idle
+    // worker pods, remembering the current count so Start can restore it.
+    onStop: function() {
+      if (this.replicas != null && this.replicas > this.minReplicas) {
+        try { localStorage.setItem('k8s.lastWorkerReplicas', String(this.replicas)); } catch (e) {}
+      }
+      this.scaleTo(this.minReplicas, 'Stop workers failed');
+    },
+
+    onStart: function() {
+      var saved = null;
+      try { saved = parseInt(localStorage.getItem('k8s.lastWorkerReplicas'), 10); } catch (e) {}
+      var n = Number.isFinite(saved) && saved > this.minReplicas ? saved : Math.max(3, this.minReplicas);
+      this.scaleTo(n, 'Start workers failed');
+    }
+  };
+
   var App = {
     uploadId: null,
     jobs: new Map(),
@@ -3243,6 +3393,7 @@ body::before {
       UI.bind();
       WS.connect();
       Cluster.init();
+      Workers.init();
       App.loadJobs();
       setInterval(function() { UI.tickStats(); }, 1000);
     },
