@@ -7,7 +7,12 @@ metadata:
     app.kubernetes.io/name: transcoder-node
     pool: cpu-worker
 spec:
-  replicas: 5
+  # Idle by default — replica count is runtime-controlled by the Web UI's
+  # Start/Stop Workers button (POST /api/cluster/workers/scale), which also
+  # resizes the underlying virtual-node-pool to match. Declaring a non-zero
+  # baseline here would silently undo "stopped" state (and re-provision
+  # billed virtual nodes) on every `kubectl apply -k`.
+  replicas: 0
   selector:
     matchLabels:
       app.kubernetes.io/name: transcoder-node

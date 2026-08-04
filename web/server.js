@@ -11,6 +11,8 @@ import { fileURLToPath } from "url";
 import http from "http";
 import https from "https";
 import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import * as ociCommon from "oci-common";
+import { ContainerEngineClient } from "oci-containerengine";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const RESOURCES_DIR = process.env.TRANSCODER_RESOURCES_DIR || path.join(__dirname, "..");
@@ -71,6 +73,85 @@ const K8S_AVAILABLE = !!process.env.KUBERNETES_SERVICE_HOST
 const K8S_NAMESPACE = K8S_AVAILABLE && fs.existsSync(K8S_NAMESPACE_PATH)
   ? fs.readFileSync(K8S_NAMESPACE_PATH, "utf8").trim()
   : "default";
+
+// OCI virtual-node-pool resizing (OCI overlay only). Scaling the
+// transcoder-worker-cpu Deployment alone doesn't shrink/grow the
+// underlying OKE Virtual Node Pool — OCI bills for every provisioned
+// virtual node regardless of whether a pod is scheduled on it, so a
+// deployment scaled to 0 workers still leaves idle (billed) nodes behind
+// unless the pool itself is resized too. OCI_WORKER_POOL_BASELINE is the
+// pool headroom that must always exist for the always-on master + web
+// pods (never touched by worker scaling); every /api/cluster/workers/scale
+// call resizes the pool to baseline + the exact replica count the Web UI
+// just requested.
+const OCI_SCALER_DIR = "/var/run/secrets/oci-scaler";
+const OCI_TENANCY_ID = process.env.OCI_TENANCY_ID || null;
+const OCI_USER_ID = process.env.OCI_USER_ID || null;
+const OCI_FINGERPRINT = process.env.OCI_FINGERPRINT || null;
+const OCI_REGION = process.env.OCI_REGION || null;
+const OCI_VIRTUAL_NODE_POOL_ID = process.env.OCI_VIRTUAL_NODE_POOL_ID || null;
+const OCI_PRIVATE_KEY_PATH = path.join(OCI_SCALER_DIR, "private-key");
+const OCI_WORKER_POOL_BASELINE = process.env.OCI_WORKER_POOL_BASELINE != null
+  ? Number(process.env.OCI_WORKER_POOL_BASELINE)
+  : 2; // transcoder-node-0 (master) + transcoder-web, always kept warm
+const OCI_POOL_RESIZE_AVAILABLE = !!OCI_TENANCY_ID && !!OCI_USER_ID
+  && !!OCI_FINGERPRINT && !!OCI_REGION && !!OCI_VIRTUAL_NODE_POOL_ID
+  && fs.existsSync(OCI_PRIVATE_KEY_PATH);
+
+let containerEngineClient = null;
+function getContainerEngineClient() {
+  if (containerEngineClient) return containerEngineClient;
+  const privateKey = fs.readFileSync(OCI_PRIVATE_KEY_PATH, "utf8");
+  const provider = new ociCommon.SimpleAuthenticationDetailsProvider(
+    OCI_TENANCY_ID,
+    OCI_USER_ID,
+    OCI_FINGERPRINT,
+    privateKey,
+    null,
+    ociCommon.Region.fromRegionId(OCI_REGION),
+  );
+  containerEngineClient = new ContainerEngineClient({ authenticationDetailsProvider: provider });
+  return containerEngineClient;
+}
+
+// A pool resize has been observed taking 5-10+ minutes end to end in this
+// cluster, so a short retry budget just times out mid-operation instead of
+// ever recovering — 30 attempts at 20s covers ~10 minutes.
+const POOL_RESIZE_RETRY_ATTEMPTS = 30;
+const POOL_RESIZE_RETRY_DELAY_MS = 20 * 1000;
+
+/**
+ * Resize the OKE virtual-node-pool to exactly `size` nodes. Fire-and-forget
+ * from the caller's perspective — OCI's update call only *submits* the
+ * resize (it returns before the pool finishes scaling, same as the rest of
+ * this file's async k8s calls), and OCI itself handles graceful pod
+ * draining on scale-down, so there's no need to wait for it here.
+ *
+ * A pool resize takes OCI several minutes to complete, and it rejects any
+ * second update submitted while one is still in flight ("... is currently
+ * being modified"). That's a real scenario, not just a testing artifact —
+ * a user clicking Stop shortly after Start hits it directly. Retry on that
+ * specific conflict so the *last* requested size eventually wins instead of
+ * silently stranding the pool at whatever size the in-flight update was
+ * targeting.
+ */
+async function resizeVirtualNodePool(size) {
+  if (!OCI_POOL_RESIZE_AVAILABLE) return;
+  const client = getContainerEngineClient();
+  for (let attempt = 1; attempt <= POOL_RESIZE_RETRY_ATTEMPTS; attempt++) {
+    try {
+      await client.updateVirtualNodePool({
+        virtualNodePoolId: OCI_VIRTUAL_NODE_POOL_ID,
+        updateVirtualNodePoolDetails: { size },
+      });
+      return;
+    } catch (err) {
+      const conflict = /currently being modified/i.test(err.message || "");
+      if (!conflict || attempt === POOL_RESIZE_RETRY_ATTEMPTS) throw err;
+      await new Promise((resolve) => setTimeout(resolve, POOL_RESIZE_RETRY_DELAY_MS));
+    }
+  }
+}
 
 /** Issue an authenticated request against the in-cluster Kubernetes API server. */
 function k8sRequest(method, apiPath, body) {
@@ -148,10 +229,24 @@ async function getWorkerReplicas() {
   };
 }
 
-/** Scale worker pods to exactly `replicas` (never below K8S_WORKER_MIN_REPLICAS). */
+/**
+ * Scale worker pods to exactly `replicas` (never below K8S_WORKER_MIN_REPLICAS).
+ * Also resizes the OCI virtual-node-pool to baseline + replicas, using the
+ * exact same replica count the caller (the Web UI's Start/Stop Workers
+ * buttons) requested — so the pool always matches actual desired worker
+ * capacity instead of drifting from whatever it happened to be created at.
+ */
 async function scaleWorkers(replicas) {
   const n = validateWorkerReplicas(replicas);
   await k8sRequest("PATCH", workerScalePath(), { spec: { replicas: n } });
+  if (OCI_POOL_RESIZE_AVAILABLE) {
+    const poolSize = OCI_WORKER_POOL_BASELINE + n;
+    resizeVirtualNodePool(poolSize)
+      .then(() => console.log(`[cluster] virtual-node-pool resize to ${poolSize} submitted`))
+      .catch((err) => {
+        console.error(`[cluster] virtual-node-pool resize to ${poolSize} failed:`, err.message);
+      });
+  }
   return n;
 }
 
@@ -750,6 +845,7 @@ app.get("/api/cluster/workers", async (_req, res) => {
       kind: K8S_WORKER_KIND,
       name: K8S_WORKER_NAME,
       namespace: K8S_NAMESPACE,
+      poolResizeAvailable: OCI_POOL_RESIZE_AVAILABLE,
     });
   } catch (err) {
     res.status(503).json({ available: false, error: err.message });

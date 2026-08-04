@@ -1,8 +1,11 @@
 # Web UI — deployed as a 4th "role" alongside the master + cpu-worker pods.
 # Runs on OKE Virtual Nodes (Pod.Standard.A1.Flex, serverless, billed per
-# pod — no per-VM "doubling up" cost concern here), still pinned via
-# required podAffinity to land on whichever node already runs a cpu-worker
-# pod purely to keep the grouping conceptually together.
+# pod). Must stay schedulable with zero cpu-worker pods running — Start/Stop
+# Workers scales cpu-worker (and the underlying virtual-node-pool) down to
+# just the master+web baseline when idle, so a *required* podAffinity on a
+# cpu-worker pod (as this used to have) would strand web in Pending forever
+# whenever it needs to reschedule while workers are stopped. No affinity at
+# all — conceptual grouping isn't worth that outage risk.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -22,14 +25,6 @@ spec:
       serviceAccountName: transcoder-web
       imagePullSecrets:
         - name: ocir-secret
-      affinity:
-        podAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            - topologyKey: kubernetes.io/hostname
-              labelSelector:
-                matchLabels:
-                  app.kubernetes.io/name: transcoder-node
-                  pool: cpu-worker
       containers:
         - name: transcoder-web
           image: transcoder-web:dev
@@ -74,6 +69,39 @@ spec:
                   key: secret-access-key
             - name: AWS_REGION
               value: "us-ashburn-1"
+            # Least-privilege OCI API identity (transcoder-web-scaler, IAM
+            # policy scoped to `manage cluster-virtualnode-pools` on this one
+            # pool OCID only via `where target.virtualnodepool.id = ...` —
+            # see oci-scaler-credentials Secret) so Start/Stop Workers can
+            # resize the virtual-node-pool itself, not just the k8s
+            # Deployment. Without this, stopping workers leaves idle (billed)
+            # OKE virtual nodes behind — scaling the Deployment to 0 doesn't
+            # shrink the pool it was provisioned from.
+            - name: OCI_TENANCY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: oci-scaler-credentials
+                  key: tenancy-id
+            - name: OCI_USER_ID
+              valueFrom:
+                secretKeyRef:
+                  name: oci-scaler-credentials
+                  key: user-id
+            - name: OCI_FINGERPRINT
+              valueFrom:
+                secretKeyRef:
+                  name: oci-scaler-credentials
+                  key: fingerprint
+            - name: OCI_REGION
+              valueFrom:
+                secretKeyRef:
+                  name: oci-scaler-credentials
+                  key: region
+            - name: OCI_VIRTUAL_NODE_POOL_ID
+              valueFrom:
+                secretKeyRef:
+                  name: oci-scaler-credentials
+                  key: virtual-node-pool-id
           ports:
             - name: http
               containerPort: 3000
@@ -100,6 +128,17 @@ spec:
             limits:
               cpu: "250m"
               memory: "256Mi"
+          volumeMounts:
+            - name: oci-scaler-key
+              mountPath: /var/run/secrets/oci-scaler
+              readOnly: true
+      volumes:
+        - name: oci-scaler-key
+          secret:
+            secretName: oci-scaler-credentials
+            items:
+              - key: private-key
+                path: private-key
 ---
 # ClusterIP only — external exposure is via the Native Ingress Controller
 # (web-ingress.yaml), since type:LoadBalancer registers an unreachable
