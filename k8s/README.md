@@ -63,3 +63,56 @@ kubectl -n transcoder port-forward svc/transcoder-master 9900:9900
 
 The cloud overlay sets these via nodeAffinity onto labeled node pools; kind
 hardcodes `none` / `baseline`.
+
+## OCI overlay (`overlays/oci-a1`)
+
+### Secrets the web pod needs before it will start
+
+`transcoder-web` exits immediately without `TRANSCODER_API_KEY`, so create the Secret **before**
+applying the overlay — applying first crash-loops the Deployment.
+
+```bash
+kubectl -n transcoder create secret generic transcoder-web-auth \
+  --from-literal=api-key=$(openssl rand -hex 32) \
+  --from-literal=admin-key=$(openssl rand -hex 32)
+```
+
+The two Secret keys map to the server's environment in `web-frontend.yaml`:
+`api-key` → `TRANSCODER_API_KEY` (every client), `admin-key` → `TRANSCODER_ADMIN_KEY`
+(worker scaling and bulk job deletion only).
+
+Read a key back to hand to an operator (it is a shared key, the same for everyone):
+
+```bash
+kubectl -n transcoder get secret transcoder-web-auth -o jsonpath='{.data.api-key}' | base64 -d
+```
+
+Rotate — replace the Secret in place, then restart so the pod re-reads it:
+
+```bash
+kubectl -n transcoder create secret generic transcoder-web-auth \
+  --from-literal=api-key=$(openssl rand -hex 32) \
+  --from-literal=admin-key=$(openssl rand -hex 32) \
+  --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n transcoder rollout restart deploy/transcoder-web
+```
+
+Never put either value in a manifest, a ConfigMap, or a commit. The admin key is the one that can
+resize the billable virtual-node pool — give it only to whoever is allowed to spend that money.
+
+### Release order
+
+```bash
+docker buildx build --platform linux/arm64 -f Dockerfile.web \
+  -t iad.ocir.io/idr5qsmifndm/transcoder-web:<tag> --push .
+git tag web-<tag>
+# create or rotate transcoder-web-auth (above) — must exist before the rollout
+kubectl apply -k k8s/overlays/oci-a1
+kubectl -n transcoder rollout status deploy/transcoder-web
+```
+
+The probes point at `/api/ready` (readiness) and `/api/health` (liveness). Both are exempt from key
+authentication because the kubelet cannot send headers.
+
+Every step above changes production and is run by the cluster owner, after written approval — not by
+whoever wrote the code.

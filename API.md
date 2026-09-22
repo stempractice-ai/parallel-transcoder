@@ -8,10 +8,25 @@ REST API, WebSocket interface, and cluster endpoints for parallel video transcod
 
 ## Authentication
 
-Optional. Set `TRANSCODER_API_KEY` environment variable to require an API key.
+**Required.** The server refuses to start outside desktop mode unless `TRANSCODER_API_KEY` is set.
 
-- Header: `X-API-Key: your-key-here`
-- Query parameter: `?api_key=your-key-here`
+- **Header only:** `X-API-Key: <key>` on every request. The `?api_key=` query form was removed — keys
+  in query strings end up in access logs and `Referer` headers.
+- **Admin routes** additionally require `X-Admin-Key: <key>`: `GET /api/cluster/workers`,
+  `POST /api/cluster/workers/scale`, `DELETE /api/jobs`. When the server has no admin key configured
+  these return `403 {"error":"Admin key not configured"}`; on a mismatch,
+  `403 {"error":"Admin privileges required"}`.
+- **Unauthenticated:** `GET /api/health` and `GET /api/ready` only, because Kubernetes probes cannot
+  send headers.
+- **WebSocket:** the first frame must be `{"type":"auth","key":"<key>"}`. The server replies
+  `{"type":"auth-ok"}`, or closes with code `4401` — immediately on a bad key, or after
+  `TRANSCODER_WS_AUTH_TIMEOUT_MS` (default 5000) of silence. Messages sent before authenticating are
+  ignored and close the socket.
+- **Downloads** are browser navigations and cannot carry a header, so they use a one-shot ticket:
+  `POST /api/download-ticket` → `GET /api/download/:jobId/:filename?ticket=…`. The download route
+  also accepts `X-API-Key` directly for scripted clients.
+
+`DESKTOP_MODE=1` (set by the desktop app, which binds loopback) disables all of the above.
 
 ---
 
@@ -20,17 +35,46 @@ Optional. Set `TRANSCODER_API_KEY` environment variable to require an API key.
 ### Health Check
 `GET /api/health`
 
-Returns server status, job counts, and platform info.
+Liveness. Unauthenticated, and deliberately free of version, platform, uptime and job counts — those
+were reconnaissance for an anonymous caller and moved to `/api/capabilities`.
 
 **Response:**
 ```json
 {
   "status": "ok",
-  "version": "1.0.0",
-  "uptime": 3600,
+  "localMode": false,
+  "authRequired": true
+}
+```
+
+`localMode` is `false` when the image ships no coordinator binary, so local transcoding is
+unavailable. `authRequired` is `false` only in desktop mode; the web UI uses it to decide whether to
+prompt for a key.
+
+### Readiness
+`GET /api/ready`
+
+Unauthenticated. Fails only on conditions that make *this* pod unable to serve.
+
+**Response:** `200 { "ready": true, "objectStore": true }`, or
+`503 { "ready": false, "reason": "disk", "objectStore": true }` when free space under the upload
+directory is below 1 GiB.
+
+`objectStore` reports bucket reachability but does **not** fail the probe: the deployment runs a
+single replica, so a transient bucket error would pull the only backend and take the UI, job list
+and downloads down with it — none of which need the object store.
+
+### Capabilities
+`GET /api/capabilities`
+
+Authenticated. Host detail the UI needs to pick encoders.
+
+**Response:**
+```json
+{
   "platform": "darwin",
   "arch": "arm64",
-  "jobs": { "total": 5, "running": 1 }
+  "localMode": false
 }
 ```
 
@@ -56,7 +100,14 @@ curl -X POST http://localhost:3000/api/upload -F "video=@video.mp4"
 ### Import Video from URL
 `POST /api/url-import`
 
-Download a video from a remote URL into the server's upload directory. Follows up to 5 redirects. Supports HTTP and HTTPS.
+Download a video from a remote URL into the server's upload directory. Follows up to 5 redirects. HTTP and HTTPS only.
+
+The target is resolved and checked before connecting, and again after every redirect. Anything
+resolving to loopback, RFC1918, link-local (including `169.254.169.254`), carrier-grade NAT, the
+unspecified block, or their IPv6 and IPv4-mapped equivalents — and any non-`http(s)` scheme — returns
+`400 {"error":"URL not allowed"}`. All rejections share that one message so the endpoint cannot be
+used to probe which internal hosts exist. The connection is made to the resolved address with the
+original `Host`/SNI, closing the DNS-rebinding window, and the body is capped at the upload limit.
 
 **Request body (JSON):**
 ```json
@@ -85,19 +136,25 @@ curl -X POST http://localhost:3000/api/url-import \
 ### Start Transcode Job
 `POST /api/transcode`
 
+Returns `501 {"error":"Local transcoding is not available in this deployment"}` where the image
+ships no coordinator binary (check `localMode` on `/api/health`).
+
+Every field is validated against a strict allowlist before anything is spawned. The first failure
+returns `400 { "error": "...", "field": "<name>" }`.
+
 **Request body (JSON):**
 
-| Field | Type | Default | Description |
+| Field | Type | Default | Accepted values |
 |-------|------|---------|-------------|
-| `uploadId` | string | *required* | ID from upload |
+| `uploadId` | string | *required* | Non-empty ID from upload |
 | `format` | string | `"hls"` | `"hls"` or `"mp4"` |
 | `mode` | string | `"normal"` | `"normal"`, `"copy"`, `"smart"`, `"smart-auto"` |
-| `crf` | number | `23` | Quality (0-51 for H.264/H.265, 0-63 for AV1) |
-| `preset` | string | `"medium"` | `"ultrafast"` to `"veryslow"` |
-| `encoder` | string | `"libx264"` | See supported encoders below |
-| `workers` | number | `0` | Worker count (0 = auto-detect) |
-| `smartTolerance` | number | `0.3` | Smart mode tolerance (0.05-0.50) |
-| `verbose` | boolean | `false` | Verbose logging |
+| `crf` | number | `23` | Integer 0–63 |
+| `preset` | string | `"medium"` | `"ultrafast"`…`"veryslow"`, or `"0"`–`"12"` for SVT-AV1 |
+| `encoder` | string | `"libx264"` | One of the 11 encoders below — nothing else reaches argv |
+| `workers` | number | `0` | Integer 0 to `min(64, CPU count)`; 0 = auto-detect |
+| `smartTolerance` | number | `0.3` | 0.05–1.0 |
+| `verbose` | boolean | `false` | Boolean only |
 
 **Supported encoders:**
 
@@ -125,14 +182,16 @@ curl -X POST http://localhost:3000/api/transcode \
 ### Analyze Video
 `POST /api/analyze`
 
-Analyze complexity without encoding.
+Analyze complexity without encoding. Returns
+`501 {"error":"Local transcoding is not available in this deployment"}` where the image ships no
+coordinator binary (check `localMode` on `/api/health`).
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `uploadId` | string | *required* | ID from upload |
-| `crf` | number | `23` | CRF for analysis |
-| `encoder` | string | `"libx264"` | Encoder for analysis |
-| `smartTolerance` | number | `0.3` | Complexity threshold |
+| `uploadId` | string | *required* | Non-empty ID from upload |
+| `crf` | number | `23` | Integer 0–63 |
+| `encoder` | string | `"libx264"` | One of the 11 encoders listed above |
+| `smartTolerance` | number | `0.3` | 0.05–1.0 |
 
 ### List Jobs
 `GET /api/jobs`
@@ -178,8 +237,24 @@ Analyze complexity without encoding.
 ]
 ```
 
+### Download Ticket
+`POST /api/download-ticket`
+
+A browser download is a plain navigation and cannot carry `X-API-Key`, so the key is traded for a
+short-lived grant instead of being put back into a query string.
+
+**Request body:** `{ "jobId": "JOB_ID", "filename": "output.mp4" }`
+
+**Response:** `{ "ticket": "<64 hex chars>" }` — valid 60 seconds, single use, bound to that one
+`jobId` + `filename`. A request for a different file does not consume it. `404` when the job has no
+output directory yet.
+
 ### Download Output File
-`GET /api/download/:jobId/:filename`
+`GET /api/download/:jobId/:filename?ticket=<ticket>`
+
+Accepts either a `?ticket=` from the endpoint above or an `X-API-Key` header, so scripted clients do
+not need a ticket. `404` when the job exists but has produced no output yet — cluster jobs have no
+output directory until assembly finishes.
 
 ### Cancel Job
 `DELETE /api/jobs/:id`
@@ -246,14 +321,18 @@ Returns information about all nodes in the cluster.
 
 Submit a transcoding job to the cluster. The master node distributes segments across all available nodes.
 
+The master's assembly path always produces MP4, so `format` must be `"mp4"`. Anything else returns
+`400 {"error":"Cluster mode produces MP4 only","field":"format"}` rather than silently handing back a
+different container.
+
 **Request body (JSON):**
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `uploadId` | string | *required* | ID from upload |
-| `format` | string | `"hls"` | Output format |
+| `format` | string | `"mp4"` | Must be `"mp4"` |
 | `encoder` | string | `"libx264"` | Video encoder |
-| `crf` | number | `23` | Quality level |
+| `crf` | number | `23` | Quality level, integer 0–63 |
 | `preset` | string | `"medium"` | Speed preset |
 
 **Response:**
@@ -271,7 +350,16 @@ Submit a transcoding job to the cluster. The master node distributes segments ac
 
 Connect to `ws://localhost:3000/ws` for real-time updates.
 
+### Authenticate
+The **first** frame must be an auth frame. Any other first message, a wrong key, or
+`TRANSCODER_WS_AUTH_TIMEOUT_MS` of silence closes the socket with code `4401`.
+```json
+{ "type": "auth", "key": "YOUR_API_KEY" }
+```
+The server acknowledges with `{ "type": "auth-ok" }`. In desktop mode no auth frame is needed.
+
 ### Subscribe
+Only accepted after `auth-ok`.
 ```json
 { "type": "subscribe", "jobId": "JOB_ID" }
 ```
@@ -301,12 +389,19 @@ Connect to `ws://localhost:3000/ws` for real-time updates.
 ### JavaScript Example
 ```javascript
 const ws = new WebSocket("ws://localhost:3000/ws");
-ws.onopen = () => ws.send(JSON.stringify({ type: "subscribe", jobId: "JOB_ID" }));
+ws.onopen = () => {
+  // Must be the first frame. Anything else closes the socket with code 4401.
+  ws.send(JSON.stringify({ type: "auth", key: API_KEY }));
+};
 ws.onmessage = (e) => {
   const msg = JSON.parse(e.data);
+  if (msg.type === "auth-ok") ws.send(JSON.stringify({ type: "subscribe", jobId: "JOB_ID" }));
   if (msg.type === "progress") console.log(`${msg.phase}: ${msg.percent}%`);
   if (msg.type === "complete") console.log("Done!", msg.outputFiles);
   if (msg.type === "error") console.error(msg.message);
+};
+ws.onclose = (e) => {
+  if (e.code === 4401) console.error("API key rejected");
 };
 ```
 
@@ -314,8 +409,11 @@ ws.onmessage = (e) => {
 ```python
 import asyncio, json, websockets
 
-async def monitor(job_id):
+async def monitor(job_id, api_key):
     async with websockets.connect("ws://localhost:3000/ws") as ws:
+        # Authenticate first, then wait for the ack before subscribing.
+        await ws.send(json.dumps({"type": "auth", "key": api_key}))
+        assert json.loads(await ws.recv())["type"] == "auth-ok"
         await ws.send(json.dumps({"type": "subscribe", "jobId": job_id}))
         async for message in ws:
             msg = json.loads(message)
@@ -323,7 +421,7 @@ async def monitor(job_id):
                 break
             print(f"{msg.get('phase', '')}: {msg.get('percent', '')}%")
 
-asyncio.run(monitor("JOB_ID"))
+asyncio.run(monitor("JOB_ID", "YOUR_API_KEY"))
 ```
 
 ---
@@ -362,22 +460,33 @@ The cluster control plane uses an OBS-websocket-inspired binary protocol over We
 
 ## Error Responses
 
-All errors return JSON:
+All errors return JSON. Messages are deliberately generic — upstream detail (hostnames, paths,
+cluster topology) is logged server-side, not returned:
 ```json
 { "error": "Description of what went wrong" }
 ```
 
+Parameter rejections additionally name the offending field: `{ "error": "...", "field": "encoder" }`.
+
 | Code | Meaning |
 |------|---------|
-| 400 | Bad request (missing/invalid parameters) |
-| 401 | Unauthorized (invalid API key) |
-| 404 | Not found (job or file) |
+| 400 | Bad request (missing/invalid parameters, or `URL not allowed`) |
+| 401 | Unauthorized (API key missing or wrong; WebSocket close code `4401`) |
+| 403 | Forbidden (admin key missing or wrong) |
+| 404 | Not found (job, file, or output not yet available) |
 | 500 | Internal server error |
+| 501 | Not available in this deployment (local transcoding without a coordinator) |
+| 503 | Dependency unavailable (cluster unreachable, Kubernetes API absent, not ready) |
 
 ## Configuration
 
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
-| `PORT` | `3000` | Server listen port |
-| `TRANSCODER_API_KEY` | *(none)* | API key for authentication |
-| `CLUSTER_MASTER` | *(none)* | Cluster master address for cluster endpoints |
+| `PORT` | `3000` | Server listen port (`0` picks an ephemeral port and logs it) |
+| `TRANSCODER_API_KEY` | **required** outside desktop mode | Shared key for every API and WebSocket call. The server exits 1 without it. |
+| `TRANSCODER_ADMIN_KEY` | *(none — admin routes return 403 until set)* | Second key for worker scaling and bulk job deletion |
+| `CLUSTER_MASTER` | `localhost:9900` | Cluster master `host:port`. Outside desktop mode, per-request overrides are ignored. |
+| `TRANSCODER_STATE_DIR` | `web/` | Root for `uploads/`, `outputs/` and the pid file |
+| `CORS_ORIGINS` | *(none — no CORS headers at all)* | Comma-separated exact origins. Credentials are never allowed. |
+| `TRANSCODER_WS_AUTH_TIMEOUT_MS` | `5000` | How long an unauthenticated WebSocket may live before close code 4401 |
+| `DESKTOP_MODE` | *(unset)* | Set to `1` by the desktop app: binds loopback, requires no keys |

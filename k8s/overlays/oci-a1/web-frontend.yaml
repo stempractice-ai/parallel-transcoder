@@ -102,19 +102,39 @@ spec:
                 secretKeyRef:
                   name: oci-scaler-credentials
                   key: virtual-node-pool-id
+            # Authentication. The server refuses to start without
+            # TRANSCODER_API_KEY, so this Secret must exist before the
+            # rollout. Create it out of band; never commit the values:
+            #   kubectl -n transcoder create secret generic transcoder-web-auth \
+            #     --from-literal=api-key=$(openssl rand -hex 32) \
+            #     --from-literal=admin-key=$(openssl rand -hex 32)
+            - name: TRANSCODER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: transcoder-web-auth
+                  key: api-key
+            - name: TRANSCODER_ADMIN_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: transcoder-web-auth
+                  key: admin-key
           ports:
             - name: http
               containerPort: 3000
               protocol: TCP
+          # Probes target the API, not the static index page: serving HTML says
+          # nothing about whether the object store is reachable or the disk is
+          # full. Both paths are exempt from key auth because kubelet cannot
+          # send headers.
           readinessProbe:
             httpGet:
-              path: /
+              path: /api/ready
               port: 3000
             initialDelaySeconds: 3
             periodSeconds: 5
           livenessProbe:
             httpGet:
-              path: /
+              path: /api/health
               port: 3000
             initialDelaySeconds: 10
             periodSeconds: 10

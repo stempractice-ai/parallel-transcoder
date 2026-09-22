@@ -10,16 +10,23 @@ import fsp from "fs/promises";
 import { fileURLToPath } from "url";
 import http from "http";
 import https from "https";
-import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, PutObjectCommand, GetObjectCommand, HeadBucketCommand } from "@aws-sdk/client-s3";
 import * as ociCommon from "oci-common";
 import { ContainerEngineClient } from "oci-containerengine";
+import { timingSafeMatch } from "./lib/auth.js";
+import { validateTranscodeParams } from "./lib/validate.js";
+import { assertPublicUrl } from "./lib/ssrf.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const RESOURCES_DIR = process.env.TRANSCODER_RESOURCES_DIR || path.join(__dirname, "..");
 const COORDINATOR_BIN = path.join(RESOURCES_DIR, "bin", "transcoder-coordinator");
 const LIB_DIR = path.join(RESOURCES_DIR, "lib") + path.sep;
-const UPLOAD_DIR = path.join(__dirname, "uploads");
-const OUTPUT_DIR = path.join(__dirname, "outputs");
+// All mutable server state (uploads, outputs, pid file) lives under one root
+// so it can be relocated onto a writable volume when the container filesystem
+// is read-only, and onto a temp dir in tests.
+const STATE_DIR = process.env.TRANSCODER_STATE_DIR || __dirname;
+const UPLOAD_DIR = path.join(STATE_DIR, "uploads");
+const OUTPUT_DIR = path.join(STATE_DIR, "outputs");
 
 const DESKTOP_MODE = process.env.DESKTOP_MODE === "1";
 const PORT = DESKTOP_MODE ? 0 : parseInt(process.env.PORT || "3000", 10);
@@ -43,6 +50,12 @@ const s3Client = OBJECT_STORE_URL
         accessKeyId: process.env.AWS_ACCESS_KEY_ID,
         secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
       },
+      // Default checksum behaviour makes the SDK wrap streamed bodies in
+      // aws-chunked transfer encoding, which OCI's S3-compatible endpoint
+      // rejects. Disabling it is what allows a stream body at all — without
+      // this the only workaround is buffering the whole object in memory.
+      requestChecksumCalculation: "WHEN_REQUIRED",
+      responseChecksumValidation: "WHEN_REQUIRED",
     })
   : null;
 
@@ -236,16 +249,40 @@ async function getWorkerReplicas() {
  * buttons) requested — so the pool always matches actual desired worker
  * capacity instead of drifting from whatever it happened to be created at.
  */
+// A resize takes minutes. Concurrent scale requests used to start one
+// long-running resize chain each, racing to set different pool sizes; now the
+// latest requested size simply supersedes the pending one and exactly one
+// chain is ever in flight.
+let resizeDesiredSize = null;
+let resizeRunning = false;
+
+async function runPoolResizes() {
+  if (resizeRunning) return;
+  resizeRunning = true;
+  try {
+    while (resizeDesiredSize !== null) {
+      const target = resizeDesiredSize;
+      try {
+        await resizeVirtualNodePool(target);
+        console.log(`[cluster] virtual-node-pool resize to ${target} submitted`);
+      } catch (err) {
+        console.error(`[cluster] virtual-node-pool resize to ${target} failed:`, err.message);
+      }
+      // Another request may have landed while this one ran; only stop once the
+      // target has stopped moving.
+      if (resizeDesiredSize === target) resizeDesiredSize = null;
+    }
+  } finally {
+    resizeRunning = false;
+  }
+}
+
 async function scaleWorkers(replicas) {
   const n = validateWorkerReplicas(replicas);
   await k8sRequest("PATCH", workerScalePath(), { spec: { replicas: n } });
   if (OCI_POOL_RESIZE_AVAILABLE) {
-    const poolSize = OCI_WORKER_POOL_BASELINE + n;
-    resizeVirtualNodePool(poolSize)
-      .then(() => console.log(`[cluster] virtual-node-pool resize to ${poolSize} submitted`))
-      .catch((err) => {
-        console.error(`[cluster] virtual-node-pool resize to ${poolSize} failed:`, err.message);
-      });
+    resizeDesiredSize = OCI_WORKER_POOL_BASELINE + n;
+    runPoolResizes();
   }
   return n;
 }
@@ -253,15 +290,15 @@ async function scaleWorkers(replicas) {
 /** Upload the local source file to the object store; returns an s3:// URI. */
 async function uploadSourceToObjectStore(jobId, inputPath) {
   const key = `jobs/${jobId}/source/${path.basename(inputPath)}`;
-  // A stream Body makes the SDK default to aws-chunked transfer encoding,
-  // which OCI's S3-compat endpoint rejects ("AWS chunked encoding not
-  // supported"). Buffering avoids that path entirely — fine at these
-  // (tens-of-MB) upload sizes.
-  const body = await fsp.readFile(inputPath);
+  // Streamed with an explicit ContentLength: buffering the source put the
+  // whole file in RSS, and anything past ~150 MB OOM-killed the 256Mi pod,
+  // taking every in-memory job record with it.
+  const { size } = await fsp.stat(inputPath);
   await s3Client.send(new PutObjectCommand({
     Bucket: OBJECT_STORE_BUCKET,
     Key: key,
-    Body: body,
+    Body: fs.createReadStream(inputPath),
+    ContentLength: size,
   }));
   return `s3://${OBJECT_STORE_BUCKET}/${key}`;
 }
@@ -300,8 +337,16 @@ async function finalizeClusterJob(jobId, job, outputUri) {
   }
 }
 
-/** Resolve cluster master from request (query/body), falling back to env default. */
+/**
+ * Resolve the cluster master for a request.
+ *
+ * Caller-supplied overrides are honoured only in desktop mode, where the user
+ * owns the machine. On a server they would let anyone aim the outbound
+ * WebSocket at any internal host, and the distinct failure strings that
+ * produced made a reliable port scanner.
+ */
 function resolveMaster(req) {
+  if (!DESKTOP_MODE) return DEFAULT_CLUSTER_MASTER;
   const raw = (req.query && req.query.master) || (req.body && req.body.master) || DEFAULT_CLUSTER_MASTER;
   const m = String(raw).trim().replace(/^ws:\/\//i, "").replace(/\/+$/, "");
   if (!/^[A-Za-z0-9_.\-]+:\d+$/.test(m)) {
@@ -315,7 +360,16 @@ function resolveMaster(req) {
 // Platform-aware library path variable
 const LIB_PATH_KEY = process.platform === "darwin" ? "DYLD_LIBRARY_PATH" : "LD_LIBRARY_PATH";
 const UPLOAD_LIMIT = 10 * 1024 * 1024 * 1024; // 10 GB
-const PID_FILE = path.join(__dirname, ".web.pid");
+const PID_FILE = path.join(STATE_DIR, ".web.pid");
+
+// The production web image deliberately ships no coordinator binary, so the
+// local (non-cluster) transcode paths cannot work there. Detect once rather
+// than letting every request fail with a bare spawn ENOENT.
+const LOCAL_MODE_AVAILABLE = fs.existsSync(COORDINATOR_BIN);
+
+// Browsers cannot set headers on a WebSocket handshake, so the first frame
+// must carry the key. This bounds how long an unauthenticated socket may live.
+const WS_AUTH_TIMEOUT_MS = Number(process.env.TRANSCODER_WS_AUTH_TIMEOUT_MS || 5000);
 
 // ---------------------------------------------------------------------------
 // Ensure directories
@@ -353,26 +407,114 @@ const subscribers = new Map();
 const app = express();
 app.use(express.json());
 
-// CORS — allow any origin for API access
-if (!DESKTOP_MODE) {
+// Security response headers. The SPA is a single file with one inline
+// <script>, one inline <style> and inline style attributes, so 'unsafe-inline'
+// is required until that markup is split out; the font hosts are the only
+// third-party origins it references.
+const CONTENT_SECURITY_POLICY = [
+  "default-src 'self'",
+  "script-src 'self' 'unsafe-inline'",
+  "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+  "font-src https://fonts.gstatic.com",
+  "img-src 'self' data:",
+  "connect-src 'self'",
+  "frame-ancestors 'none'",
+].join("; ");
+
+app.disable("x-powered-by");
+app.use((_req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("Content-Security-Policy", CONTENT_SECURITY_POLICY);
+  next();
+});
+
+// CORS is opt-in and never reflective. The shipped SPA is same-origin, so by
+// default no CORS headers are emitted at all; CORS_ORIGINS holds an exact
+// allowlist for any out-of-band client. Credentials are never allowed.
+const CORS_ORIGINS = new Set(
+  (process.env.CORS_ORIGINS || "").split(",").map((o) => o.trim()).filter(Boolean),
+);
+if (!DESKTOP_MODE && CORS_ORIGINS.size > 0) {
   app.use((req, res, next) => {
-    res.header("Access-Control-Allow-Origin", req.headers.origin || "*");
-    res.header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-    res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key");
-    res.header("Access-Control-Allow-Credentials", "true");
+    res.header("Vary", "Origin");
+    if (req.headers.origin && CORS_ORIGINS.has(req.headers.origin)) {
+      res.header("Access-Control-Allow-Origin", req.headers.origin);
+      res.header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+      res.header("Access-Control-Allow-Headers", "Content-Type, X-API-Key, X-Admin-Key");
+    }
     if (req.method === "OPTIONS") return res.sendStatus(204);
     next();
   });
 }
 
-// Optional API key authentication (set TRANSCODER_API_KEY env var to enable)
+// API key authentication. Fails closed: outside desktop mode the server
+// refuses to start without a key rather than serving the API anonymously.
 const API_KEY = process.env.TRANSCODER_API_KEY || null;
+const ADMIN_KEY = process.env.TRANSCODER_ADMIN_KEY || null;
+if (!DESKTOP_MODE && !API_KEY) {
+  console.error("TRANSCODER_API_KEY is required outside desktop mode");
+  process.exit(1);
+}
+
 app.use("/api", (req, res, next) => {
-  if (!API_KEY) return next(); // No key configured — open access
-  const provided = req.headers["x-api-key"] || req.query.api_key;
-  if (provided === API_KEY) return next();
+  if (DESKTOP_MODE) return next();
+  // Kubernetes probes cannot send headers, so the two probe paths stay open.
+  if (req.path === "/health" || req.path === "/ready") return next();
+  // Downloads are <a href> navigations and cannot carry a header; that route
+  // authenticates itself, accepting either the key or a one-shot ticket.
+  if (req.path.startsWith("/download/")) return next();
+  if (timingSafeMatch(req.headers["x-api-key"], API_KEY)) return next();
   res.status(401).json({ error: "Invalid or missing API key" });
 });
+
+/**
+ * Second factor for destructive and cost-bearing routes (worker scaling, bulk
+ * job deletion). Fails closed when no admin key is configured.
+ */
+function requireAdmin(req, res, next) {
+  if (DESKTOP_MODE) return next();
+  if (!ADMIN_KEY) return res.status(403).json({ error: "Admin key not configured" });
+  if (timingSafeMatch(req.headers["x-admin-key"], ADMIN_KEY)) return next();
+  res.status(403).json({ error: "Admin privileges required" });
+}
+
+// Short-lived, single-use download grants. A browser download is a plain
+// navigation, so the alternative would be putting the API key back into query
+// strings — where it lands in access logs and Referer headers.
+const DOWNLOAD_TICKET_TTL_MS = 60_000;
+/** @type {Map<string, {jobId: string, filename: string, expires: number}>} */
+const downloadTickets = new Map();
+
+function issueDownloadTicket(jobId, filename) {
+  const now = Date.now();
+  for (const [id, t] of downloadTickets) {
+    if (t.expires <= now) downloadTickets.delete(id);
+  }
+  const ticket = crypto.randomBytes(32).toString("hex");
+  downloadTickets.set(ticket, { jobId, filename, expires: now + DOWNLOAD_TICKET_TTL_MS });
+  return ticket;
+}
+
+/**
+ * True when `ticket` grants exactly this file, consuming it.
+ *
+ * A mismatched request must not spend the grant: otherwise any guessed URL
+ * burns a legitimate user's ticket before they can use it.
+ */
+function redeemDownloadTicket(ticket, jobId, filename) {
+  if (typeof ticket !== "string") return false;
+  const entry = downloadTickets.get(ticket);
+  if (!entry) return false;
+  if (entry.expires <= Date.now()) {
+    downloadTickets.delete(ticket);
+    return false;
+  }
+  if (entry.jobId !== jobId || entry.filename !== filename) return false;
+  downloadTickets.delete(ticket);
+  return true;
+}
 
 app.use(express.static(path.join(__dirname, "public")));
 
@@ -391,18 +533,68 @@ const upload = multer({ storage, limits: { fileSize: UPLOAD_LIMIT } });
 // Routes
 // ---------------------------------------------------------------------------
 
-// Health / server info
+// Liveness. Unauthenticated because kubelet cannot present a key; the body is
+// deliberately free of version, platform and job counts, which are
+// reconnaissance for an unauthenticated caller.
 app.get("/api/health", (_req, res) => {
+  // authRequired lets the shipped SPA — which is the same file in the desktop
+  // build, where no key exists — decide whether to prompt and whether a
+  // WebSocket may be opened at all.
+  res.json({ status: "ok", localMode: LOCAL_MODE_AVAILABLE, authRequired: !DESKTOP_MODE });
+});
+
+// Readiness. Only conditions that make *this* pod unable to serve flip it
+// unready.
+//
+// Object-store reachability is reported but deliberately does NOT fail the
+// probe: the deployment runs a single replica behind the load balancer
+// (web-frontend.yaml `replicas: 1`), so a transient bucket error would pull
+// the only backend and turn a partial degradation — cluster submission is the
+// one feature that needs S3 — into a total outage of the UI, job list and
+// downloads. Revisit once there is more than one replica and a PDB.
+const READY_CACHE_MS = 10_000;
+const MIN_FREE_BYTES = 1024 * 1024 * 1024; // 1 GiB
+let bucketProbe = { at: 0, ok: true };
+
+async function objectStoreReachable() {
+  if (!s3Client) return true;
+  const now = Date.now();
+  // The readiness probe runs every few seconds; one HeadBucket per probe would
+  // be pure overhead against the object store.
+  if (now - bucketProbe.at < READY_CACHE_MS) return bucketProbe.ok;
+  let ok = false;
+  try {
+    await s3Client.send(new HeadBucketCommand({ Bucket: OBJECT_STORE_BUCKET }));
+    ok = true;
+  } catch (err) {
+    console.error("[ready] object store unreachable:", err.message);
+  }
+  bucketProbe = { at: now, ok };
+  return ok;
+}
+
+app.get("/api/ready", async (_req, res) => {
+  const objectStore = await objectStoreReachable();
+  try {
+    const fsStat = await fsp.statfs(UPLOAD_DIR);
+    // Out of disk is local and fatal: uploads and outputs both fail.
+    if (fsStat.bavail * fsStat.bsize < MIN_FREE_BYTES) {
+      return res.status(503).json({ ready: false, reason: "disk", objectStore });
+    }
+  } catch (err) {
+    console.error("[ready] statfs failed:", err.message);
+    return res.status(503).json({ ready: false, reason: "disk", objectStore });
+  }
+  res.json({ ready: true, objectStore });
+});
+
+// Host detail the UI needs to pick encoders. Authenticated — this is the
+// information /api/health used to hand out anonymously.
+app.get("/api/capabilities", (_req, res) => {
   res.json({
-    status: "ok",
-    version: "1.0.0",
-    uptime: Math.floor(process.uptime()),
     platform: process.platform,
     arch: process.arch,
-    jobs: {
-      total: jobs.size,
-      running: [...jobs.values()].filter(j => j.status === "running").length,
-    },
+    localMode: LOCAL_MODE_AVAILABLE,
   });
 });
 
@@ -425,19 +617,18 @@ app.post("/api/url-import", async (req, res) => {
     return res.status(400).json({ error: "url is required" });
   }
 
-  // Validate URL scheme
-  let parsed;
+  // Scheme check plus DNS resolution against the blocked-range list. Rejections
+  // are deliberately indistinguishable from one another so the endpoint cannot
+  // be used to probe which internal hosts exist.
+  let resolved;
   try {
-    parsed = new URL(url);
+    resolved = await assertPublicUrl(url);
   } catch {
-    return res.status(400).json({ error: "Invalid URL" });
-  }
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    return res.status(400).json({ error: "Only http and https URLs are supported" });
+    return res.status(400).json({ error: "URL not allowed" });
   }
 
   // Derive filename from URL path or use a generic name
-  const urlPath = parsed.pathname.split("/").pop() || "video";
+  const urlPath = new URL(url).pathname.split("/").pop() || "video";
   const safeName = urlPath.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 200);
   const ext = path.extname(safeName) || ".mp4";
   const base = path.basename(safeName, ext);
@@ -445,7 +636,7 @@ app.post("/api/url-import", async (req, res) => {
   const destPath = path.join(UPLOAD_DIR, filename);
 
   try {
-    await downloadFile(url, destPath);
+    await downloadFile(url, destPath, 5, resolved);
     const stat = fs.statSync(destPath);
     res.json({
       uploadId: filename,
@@ -456,12 +647,25 @@ app.post("/api/url-import", async (req, res) => {
   } catch (err) {
     // Clean up partial download
     try { fs.unlinkSync(destPath); } catch {}
-    res.status(500).json({ error: `Download failed: ${err.message}` });
+    if (err && err.blocked) {
+      return res.status(400).json({ error: "URL not allowed" });
+    }
+    console.error(`[url-import] download failed for ${filename}:`, err.message);
+    res.status(500).json({ error: "Download failed" });
   }
 });
 
 // Start transcode job
 app.post("/api/transcode", async (req, res) => {
+  // Short-circuit before any mkdir: the production web image ships no
+  // coordinator, and the old path left orphaned job directories behind.
+  if (!LOCAL_MODE_AVAILABLE) {
+    return res.status(501).json({ error: "Local transcoding is not available in this deployment" });
+  }
+
+  const invalid = validateTranscodeParams(req.body);
+  if (invalid) return res.status(400).json(invalid);
+
   const {
     uploadId,
     format = "hls",
@@ -473,10 +677,6 @@ app.post("/api/transcode", async (req, res) => {
     workers = 0,
     verbose = false,
   } = req.body;
-
-  if (!uploadId) {
-    return res.status(400).json({ error: "uploadId is required" });
-  }
 
   const inputPath = path.join(UPLOAD_DIR, path.basename(uploadId));
   if (!fs.existsSync(inputPath)) {
@@ -591,16 +791,19 @@ app.post("/api/transcode", async (req, res) => {
 
 // Analyze (smart report)
 app.post("/api/analyze", async (req, res) => {
+  if (!LOCAL_MODE_AVAILABLE) {
+    return res.status(501).json({ error: "Local transcoding is not available in this deployment" });
+  }
+
+  const invalid = validateTranscodeParams(req.body);
+  if (invalid) return res.status(400).json(invalid);
+
   const {
     uploadId,
     crf = 23,
     encoder = "libx264",
     smartTolerance = 0.3,
   } = req.body;
-
-  if (!uploadId) {
-    return res.status(400).json({ error: "uploadId is required" });
-  }
 
   const inputPath = path.join(UPLOAD_DIR, path.basename(uploadId));
   if (!fs.existsSync(inputPath)) {
@@ -632,7 +835,8 @@ app.post("/api/analyze", async (req, res) => {
     }
   } catch (err) {
     fsp.rm(tmpOutputDir, { recursive: true, force: true }).catch(() => {});
-    res.status(500).json({ error: err.message });
+    console.error("[analyze] failed:", err.message);
+    res.status(500).json({ error: "Analyze failed" });
   }
 });
 
@@ -646,7 +850,7 @@ app.get("/api/jobs", (_req, res) => {
 });
 
 // Delete all jobs and their stored files (uploaded source + output dir)
-app.delete("/api/jobs", async (_req, res) => {
+app.delete("/api/jobs", requireAdmin, async (_req, res) => {
   let count = 0;
   for (const job of jobs.values()) {
     if (job.process) {
@@ -678,6 +882,7 @@ app.get("/api/jobs/:id", (req, res) => {
 app.get("/api/jobs/:id/files", (req, res) => {
   const job = jobs.get(req.params.id);
   if (!job) return res.status(404).json({ error: "Job not found" });
+  if (!job.outputDir) return res.status(404).json({ error: "Job output not available" });
   const files = listOutputFiles(job.outputDir);
   res.json(files);
 });
@@ -714,13 +919,34 @@ app.delete("/api/jobs/:id", async (req, res) => {
   res.json({ deleted: true });
 });
 
-// Download output file
+// Trade an API key for a one-shot grant on a single output file, so the UI can
+// hand the browser an ordinary download link.
+app.post("/api/download-ticket", (req, res) => {
+  const { jobId, filename } = req.body || {};
+  if (typeof jobId !== "string" || typeof filename !== "string") {
+    return res.status(400).json({ error: "jobId and filename are required" });
+  }
+  const job = jobs.get(jobId);
+  if (!job || !job.outputDir) return res.status(404).json({ error: "Job output not available" });
+  res.json({ ticket: issueDownloadTicket(jobId, path.basename(filename)) });
+});
+
+// Download output file. Authenticates itself because it is exempt from the
+// header middleware: either a valid key header or a matching one-shot ticket.
 app.get("/api/download/:jobId/:filename", (req, res) => {
+  const filename = path.basename(req.params.filename);
+  const authorized = DESKTOP_MODE
+    || timingSafeMatch(req.headers["x-api-key"], API_KEY)
+    || redeemDownloadTicket(req.query.ticket, req.params.jobId, filename);
+  if (!authorized) return res.status(401).json({ error: "Invalid or missing API key" });
+
   const job = jobs.get(req.params.jobId);
   if (!job) return res.status(404).json({ error: "Job not found" });
+  // Cluster jobs have no outputDir until finalizeClusterJob runs; joining null
+  // threw a TypeError and surfaced as a 500.
+  if (!job.outputDir) return res.status(404).json({ error: "Job output not available" });
 
   // Path join safety: ensure filename doesn't escape the output dir
-  const filename = path.basename(req.params.filename);
   const filePath = path.join(job.outputDir, filename);
 
   if (!filePath.startsWith(job.outputDir)) {
@@ -747,7 +973,8 @@ app.get("/api/cluster/status", async (req, res) => {
     const status = await queryCluster(master);
     res.json({ master, ...status });
   } catch (err) {
-    res.status(503).json({ master, error: `Cluster unreachable: ${err.message}` });
+    console.error("[cluster] status query failed:", err.message);
+    res.status(503).json({ master, error: "Cluster unreachable" });
   }
 });
 
@@ -760,7 +987,8 @@ app.get("/api/cluster/nodes", async (req, res) => {
     const status = await queryCluster(master);
     res.json(status.nodes || []);
   } catch (err) {
-    res.status(503).json({ error: `Cluster unreachable: ${err.message}` });
+    console.error("[cluster] nodes query failed:", err.message);
+    res.status(503).json({ error: "Cluster unreachable" });
   }
 });
 
@@ -770,17 +998,18 @@ app.post("/api/cluster/transcode", async (req, res) => {
   try { master = resolveMaster(req); }
   catch (err) { return res.status(err.statusCode || 400).json({ error: err.message }); }
 
+  const invalid = validateTranscodeParams(req.body, { cluster: true });
+  if (invalid) return res.status(400).json(invalid);
+
   const {
     uploadId,
-    format = "hls",
+    // The master's assembly path always emits MP4; anything else is rejected
+    // above rather than silently returning a different container.
+    format = "mp4",
     crf = 23,
     preset = "medium",
     encoder = "libx264",
   } = req.body;
-
-  if (!uploadId) {
-    return res.status(400).json({ error: "uploadId is required" });
-  }
 
   const inputPath = path.join(UPLOAD_DIR, path.basename(uploadId));
   if (!fs.existsSync(inputPath)) {
@@ -826,14 +1055,17 @@ app.post("/api/cluster/transcode", async (req, res) => {
   } catch (err) {
     job.status = "error";
     job.phase = "error";
-    job.errorMessage = `Cluster submission failed: ${err.message}`;
+    // jobSummary surfaces errorMessage to clients, so the detail has to be
+    // kept out of the stored value too, not just the response body.
+    console.error(`[cluster] submission failed for job ${jobId}:`, err.message);
+    job.errorMessage = "Cluster submission failed";
     broadcast(jobId, { type: "error", jobId, message: job.errorMessage });
-    res.status(500).json({ error: `Cluster submission failed: ${err.message}` });
+    res.status(500).json({ error: "Cluster submission failed" });
   }
 });
 
 // Worker pod scaling status (k8s-only — used to show/hide Start/Stop Workers in the UI)
-app.get("/api/cluster/workers", async (_req, res) => {
+app.get("/api/cluster/workers", requireAdmin, async (_req, res) => {
   if (!K8S_AVAILABLE) return res.json({ available: false });
   try {
     const { replicas, currentReplicas } = await getWorkerReplicas();
@@ -848,18 +1080,28 @@ app.get("/api/cluster/workers", async (_req, res) => {
       poolResizeAvailable: OCI_POOL_RESIZE_AVAILABLE,
     });
   } catch (err) {
-    res.status(503).json({ available: false, error: err.message });
+    console.error("[cluster] worker status failed:", err.message);
+    res.status(503).json({ available: false, error: "Worker status unavailable" });
   }
 });
 
 // Scale worker pods up/down to preserve cost when idle
-app.post("/api/cluster/workers/scale", async (req, res) => {
+app.post("/api/cluster/workers/scale", requireAdmin, async (req, res) => {
   if (!K8S_AVAILABLE) return res.status(503).json({ error: "Kubernetes API not available" });
+  // Validate before the try so a bad replica count reports its own static
+  // message, while infrastructure failures stay generic.
+  let requested;
   try {
-    const n = await scaleWorkers(req.body && req.body.replicas);
+    requested = validateWorkerReplicas(req.body && req.body.replicas);
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+  try {
+    const n = await scaleWorkers(requested);
     res.json({ ok: true, replicas: n });
   } catch (err) {
-    res.status(400).json({ error: err.message });
+    console.error("[cluster] scale failed:", err.message);
+    res.status(503).json({ error: "Scale request failed" });
   }
 });
 
@@ -890,43 +1132,69 @@ server.on("upgrade", (request, socket, head) => {
 });
 
 wss.on("connection", (ws) => {
-  ws.on("message", (data) => {
-    try {
-      const msg = JSON.parse(data.toString());
-      if (msg.type === "subscribe" && msg.jobId) {
-        let subs = subscribers.get(msg.jobId);
-        if (!subs) {
-          subs = new Set();
-          subscribers.set(msg.jobId, subs);
-        }
-        subs.add(ws);
+  // The handshake cannot carry a header from a browser, so the socket is
+  // untrusted until its first frame proves the key — and is dropped if that
+  // frame never arrives.
+  let authed = DESKTOP_MODE;
+  let authTimer = null;
+  if (!authed) {
+    authTimer = setTimeout(() => ws.close(4401, "unauthorized"), WS_AUTH_TIMEOUT_MS);
+  }
 
-        // Send current state to the newly subscribed client
-        const job = jobs.get(msg.jobId);
-        if (job) {
-          safeSend(ws, {
-            type: "progress",
-            jobId: msg.jobId,
-            phase: job.phase,
-            percent: job.percent,
-            message: `Subscribed — current phase: ${job.phase}`,
-            startedAt: job.startedAt,
-            now: Date.now(),
-            segmentsCompleted: job.segmentsCompleted,
-            segmentsTotal: job.segmentsTotal,
-          });
-          // Send recent logs
-          for (const line of job.logs) {
-            safeSend(ws, { type: "log", jobId: msg.jobId, line });
-          }
+  ws.on("message", (data) => {
+    let msg;
+    try {
+      msg = JSON.parse(data.toString());
+    } catch {
+      return; // ignore malformed messages
+    }
+
+    if (!authed) {
+      // Anything other than a valid auth frame ends the connection; a client
+      // that could subscribe first would bypass authentication entirely.
+      if (msg.type === "auth" && timingSafeMatch(msg.key, API_KEY)) {
+        authed = true;
+        clearTimeout(authTimer);
+        authTimer = null;
+        safeSend(ws, { type: "auth-ok" });
+      } else {
+        ws.close(4401, "unauthorized");
+      }
+      return;
+    }
+
+    if (msg.type === "subscribe" && msg.jobId) {
+      let subs = subscribers.get(msg.jobId);
+      if (!subs) {
+        subs = new Set();
+        subscribers.set(msg.jobId, subs);
+      }
+      subs.add(ws);
+
+      // Send current state to the newly subscribed client
+      const job = jobs.get(msg.jobId);
+      if (job) {
+        safeSend(ws, {
+          type: "progress",
+          jobId: msg.jobId,
+          phase: job.phase,
+          percent: job.percent,
+          message: `Subscribed — current phase: ${job.phase}`,
+          startedAt: job.startedAt,
+          now: Date.now(),
+          segmentsCompleted: job.segmentsCompleted,
+          segmentsTotal: job.segmentsTotal,
+        });
+        // Send recent logs
+        for (const line of job.logs) {
+          safeSend(ws, { type: "log", jobId: msg.jobId, line });
         }
       }
-    } catch {
-      // ignore malformed messages
     }
   });
 
   ws.on("close", () => {
+    clearTimeout(authTimer);
     // Remove from all subscriber sets
     for (const subs of subscribers.values()) {
       subs.delete(ws);
@@ -1221,29 +1489,83 @@ function submitClusterJob(master, { jobId, inputPath, format, crf, preset, encod
   });
 }
 
-/** Download a file from a URL, following redirects (up to 5). */
-function downloadFile(url, destPath, maxRedirects = 5) {
+/**
+ * Download a file from a URL, following redirects (up to 5).
+ *
+ * Every hop is validated against the blocked-range list and then dialled by
+ * resolved IP with the original hostname carried in Host/servername, so a
+ * DNS answer cannot change between the check and the connection. The response
+ * body is capped at UPLOAD_LIMIT.
+ */
+function downloadFile(url, destPath, maxRedirects = 5, preResolved = null) {
+  const blocked = () => Object.assign(new Error("URL not allowed"), { blocked: true });
+
   return new Promise((resolve, reject) => {
-    const doRequest = (currentUrl, redirectsLeft) => {
-      const mod = currentUrl.startsWith("https") ? https : http;
-      const req = mod.get(currentUrl, { headers: { "User-Agent": "ParallelTranscoder/1.0" } }, (res) => {
-        // Follow redirects
+    const doRequest = async (currentUrl, redirectsLeft, resolved) => {
+      let target = resolved;
+      if (!target) {
+        try {
+          target = await assertPublicUrl(currentUrl);
+        } catch {
+          reject(blocked());
+          return;
+        }
+      }
+
+      const parsed = new URL(currentUrl);
+      const isHttps = parsed.protocol === "https:";
+      const mod = isHttps ? https : http;
+      const pinned = target.addresses[0].address;
+
+      const options = {
+        host: pinned,
+        port: parsed.port || (isHttps ? 443 : 80),
+        path: parsed.pathname + parsed.search,
+        headers: { "User-Agent": "ParallelTranscoder/1.0", Host: parsed.host },
+        ...(isHttps ? { servername: target.hostname } : {}),
+      };
+
+      const req = mod.get(options, (res) => {
+        // Follow redirects — re-validated, because the first hop's safety says
+        // nothing about where it points.
         if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+          res.resume();
           if (redirectsLeft <= 0) {
             reject(new Error("Too many redirects"));
             return;
           }
-          const next = new URL(res.headers.location, currentUrl).href;
-          doRequest(next, redirectsLeft - 1);
+          let next;
+          try {
+            next = new URL(res.headers.location, currentUrl);
+          } catch {
+            reject(blocked());
+            return;
+          }
+          if (next.protocol !== "http:" && next.protocol !== "https:") {
+            reject(blocked());
+            return;
+          }
+          doRequest(next.href, redirectsLeft - 1, null);
           return;
         }
 
         if (res.statusCode < 200 || res.statusCode >= 300) {
+          res.resume();
           reject(new Error(`HTTP ${res.statusCode}`));
           return;
         }
 
         const file = fs.createWriteStream(destPath);
+        let received = 0;
+        res.on("data", (chunk) => {
+          received += chunk.length;
+          if (received > UPLOAD_LIMIT) {
+            res.destroy();
+            file.destroy();
+            try { fs.unlinkSync(destPath); } catch {}
+            reject(new Error("Remote file exceeds the upload limit"));
+          }
+        });
         res.pipe(file);
         file.on("finish", () => { file.close(resolve); });
         file.on("error", (err) => {
@@ -1257,7 +1579,7 @@ function downloadFile(url, destPath, maxRedirects = 5) {
         reject(new Error("Download timed out"));
       });
     };
-    doRequest(url, maxRedirects);
+    doRequest(url, maxRedirects, preResolved).catch(reject);
   });
 }
 
@@ -1357,8 +1679,14 @@ const listenCallback = () => {
     const boundPort = server.address().port;
     process.stdout.write(`__DESKTOP_READY__PORT=${boundPort}\n`);
   } else {
-    fs.writeFileSync(PID_FILE, String(process.pid));
-    console.log(`Parallel Transcoder web server listening on http://localhost:${PORT} (pid ${process.pid})`);
+    // Containers have no use for a pid file, and the read-only root filesystem
+    // the hardened manifests use would make this throw at startup.
+    if (!process.env.KUBERNETES_SERVICE_HOST) {
+      try { fs.writeFileSync(PID_FILE, String(process.pid)); } catch { /* non-fatal */ }
+    }
+    // Report the port actually bound, not the configured one — PORT=0 asks the
+    // OS for an ephemeral port, and callers need to learn which one it picked.
+    console.log(`Parallel Transcoder web server listening on http://localhost:${server.address().port} (pid ${process.pid})`);
   }
 };
 

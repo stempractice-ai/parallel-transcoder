@@ -1,6 +1,5 @@
 # Rust
 /target/
-Cargo.lock
 **/*.rs.bk
 *.pdb
 
@@ -9,14 +8,15 @@ node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
-package-lock.json
 
 # MCPB
 *.mcpb
 bin/*
 !bin/transcoder-desktop
 !bin/test.sh
-lib/
+# Root-only: this is the FFmpeg shared-library dir shipped beside bin/.
+# Unanchored `lib/` also swallowed web/lib/, which is source.
+/lib/
 
 # Build artifacts
 dist/
@@ -51,3 +51,8 @@ web/.web.pid
 # Environment
 .env
 .env.local
+
+# Keys — never commit
+*.pem
+*.key
+*.p12

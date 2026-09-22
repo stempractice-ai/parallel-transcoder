@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+jobs:
+  node:
+    name: Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      # Both legs must report: 20 is the floor the production image runs
+      # (Dockerfile.web uses node:20-slim), 24 is what developers run locally.
+      fail-fast: false
+      matrix:
+        node: ['20', '24']
+    steps:
+      # Actions are pinned by commit SHA, not tag: a tag is mutable and an
+      # action runs with access to this repository's token.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm ci
+      # Bare `node --test` on purpose: a quoted glob argument is a hard error
+      # on Node 20 ("Could not find …", exit 1) while positional paths are
+      # interpreted differently on 20 and 24. Default discovery behaves
+      # identically on both.
+      - run: npm test
+      # --omit=dev is load-bearing: the shipped closure has no advisories, but
+      # electron/electron-builder (devDependencies, tracked separately as
+      # SUP-D1) carry high and critical ones that this gate does not own.
+      - run: npm audit --omit=dev --audit-level=high
+
+  rust:
+    name: cluster crate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # Pinned by SHA, so the toolchain can no longer be inferred from the ref
+      # name — it has to be named explicitly.
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      # Only the cluster crate: coordinator and worker link libav in-process
+      # and need FFmpeg 8.1 development libraries, so they are built and tested
+      # inside the Docker builder stage instead.
+      - run: cargo test -p transcoder-cluster --locked

@@ -21,6 +21,7 @@ WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY package.json ./
 COPY web/server.js web/server.js
+COPY web/lib web/lib
 COPY web/public web/public
 RUN mkdir -p web/uploads web/outputs && chown -R 10001:10001 /app
 USER 10001

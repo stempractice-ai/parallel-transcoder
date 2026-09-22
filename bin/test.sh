@@ -86,6 +86,21 @@ test_node_syntax() {
     return $rc
 }
 
+# --- Node.js test suite (desktop + web) ---
+# Bare `node --test`: a quoted glob is a hard error on Node 20 and positional
+# paths mean different things on 20 vs 24; default discovery is portable.
+test_node_tests() {
+    if ! command -v npm &>/dev/null; then
+        echo "  npm not found"
+        return 1
+    fi
+    if [[ ! -d node_modules ]]; then
+        echo "  installing npm dependencies..."
+        npm ci --silent || return 1
+    fi
+    npm test
+}
+
 # --- Binary --help smoke tests ---
 test_binary_help() {
     local rc=0 bin
@@ -153,6 +168,7 @@ echo "Platform: $OS $(uname -m)"
 run "Rust tests (cargo test --workspace)" test_cargo
 run "Shell script syntax"                 test_shell_syntax
 run "Node.js script syntax"               test_node_syntax
+run "Node.js test suite (npm test)"        test_node_tests
 run "Binary --help smoke tests"           test_binary_help
 run "Desktop launcher startup"            test_desktop_launch
 

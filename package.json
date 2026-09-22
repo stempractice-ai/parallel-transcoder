@@ -13,7 +13,7 @@
     "desktop:build": "electron-builder",
     "desktop:build:mac": "electron-builder --mac",
     "desktop:build:linux": "electron-builder --linux",
-    "test": "node --test 'desktop/test/**/*.test.js'",
+    "test": "node --test",
     "test:rust": "cargo test --workspace"
   },
   "keywords": [
@@ -40,7 +40,7 @@
     "electron-builder": "^25.0.0"
   },
   "engines": {
-    "node": ">=16.0.0"
+    "node": ">=20.0.0"
   },
   "build": {
     "appId": "com.munibajpai.parallel-transcoder",
@@ -53,6 +53,7 @@
       "desktop/**/*",
       "!desktop/test/**/*",
       "web/server.js",
+      "web/lib/**/*",
       "web/public/**/*",
       "package.json",
       "!web/uploads/**/*",

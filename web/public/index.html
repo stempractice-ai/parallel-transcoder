@@ -1917,6 +1917,20 @@ body::before {
         </div>
       </div>
 
+      <!-- Authentication -->
+      <div class="panel-section" id="authSection">
+        <div class="section-label">Authentication</div>
+        <div class="cluster-pane-help" id="authHelp">API key is kept in this browser; the admin key only until this tab closes. Both are sent as request headers.</div>
+        <label class="field-label" for="apiKey">API key</label>
+        <div class="cluster-row">
+          <input type="password" id="apiKey" placeholder="required" spellcheck="false" autocomplete="off">
+        </div>
+        <label class="field-label" for="adminKey">Admin key</label>
+        <div class="cluster-row">
+          <input type="password" id="adminKey" placeholder="worker scaling only" spellcheck="false" autocomplete="off">
+        </div>
+      </div>
+
       <!-- Cluster -->
       <div class="panel-section">
         <div class="section-label">Cluster</div>
@@ -2126,17 +2140,87 @@ body::before {
    * API
    * ================================================================== */
 
+  /* Credentials are kept client-side on a same-origin page. Admin routes take a
+   * second key so a normal operator cannot resize the billable node pool — and
+   * because that key can spend money, it lives in sessionStorage and dies with
+   * the tab, rather than sitting in localStorage on a shared machine. */
+  var Auth = {
+    KEY_ITEM: 'api.key',
+    ADMIN_ITEM: 'api.adminKey',
+    onUnauthorized: null,
+    /* Whether this deployment demands a key. Assumed true until /api/health
+     * says otherwise, so a slow probe never leaks requests unauthenticated.
+     * The desktop build reports false and has no key at all. */
+    required: true,
+    store: function(item) {
+      return item === Auth.ADMIN_ITEM ? sessionStorage : localStorage;
+    },
+    get: function(item) {
+      try { return Auth.store(item).getItem(item) || ''; } catch (e) { return ''; }
+    },
+    set: function(item, value) {
+      try { Auth.store(item).setItem(item, value || ''); } catch (e) {}
+    },
+    key: function() { return Auth.get(Auth.KEY_ITEM); },
+    adminKey: function() { return Auth.get(Auth.ADMIN_ITEM); },
+    clearKey: function() { Auth.set(Auth.KEY_ITEM, ''); },
+    needsAdmin: function(url, method) {
+      if (url.indexOf('/api/cluster/workers') === 0) return true;
+      return url === '/api/jobs' && String(method || 'GET').toUpperCase() === 'DELETE';
+    },
+    headers: function(url, opts) {
+      var h = Object.assign({}, (opts && opts.headers) || {});
+      var k = Auth.key();
+      if (k) h['X-API-Key'] = k;
+      if (Auth.needsAdmin(url, opts && opts.method)) {
+        var a = Auth.adminKey();
+        if (a) h['X-Admin-Key'] = a;
+      }
+      return h;
+    }
+  };
+
   var API = {
+    /* Every call goes through here so no route can be left unauthenticated. */
+    fetch: function(url, opts) {
+      var o = Object.assign({}, opts || {});
+      o.headers = Auth.headers(url, o);
+      /* Captured before the request: by the time a 401 lands, a concurrent
+       * failure may already have cleared storage, and reading it back would
+       * misreport a rejected key as "no key supplied". */
+      var sentKey = !!Auth.key();
+      return fetch(url, o).then(function(r) {
+        if (r.status === 401) {
+          Auth.clearKey();
+          if (Auth.onUnauthorized) Auth.onUnauthorized(sentKey);
+          throw new Error('Unauthorized — enter your API key');
+        }
+        return r;
+      });
+    },
+
     upload: function(file, onProgress) {
       return new Promise(function(resolve, reject) {
         var xhr = new XMLHttpRequest();
         var form = new FormData();
         form.append('video', file);
         xhr.open('POST', '/api/upload');
+        /* XHR is the one request that is not a fetch; it needs the header too.
+         * The key is captured here, before send, for the same reason as in
+         * API.fetch: a concurrent 401 can clear storage before this one lands. */
+        var h = Auth.headers('/api/upload', { method: 'POST' });
+        var sentKey = !!Auth.key();
+        Object.keys(h).forEach(function(name) { xhr.setRequestHeader(name, h[name]); });
         xhr.upload.onprogress = function(e) {
           if (e.lengthComputable && onProgress) onProgress(Math.round((e.loaded / e.total) * 100));
         };
         xhr.onload = function() {
+          if (xhr.status === 401) {
+            Auth.clearKey();
+            if (Auth.onUnauthorized) Auth.onUnauthorized(sentKey);
+            reject(new Error('Unauthorized — enter your API key'));
+            return;
+          }
           if (xhr.status >= 200 && xhr.status < 300) {
             try { resolve(JSON.parse(xhr.responseText)); }
             catch (err) { reject(new Error('Invalid JSON response')); }
@@ -2150,7 +2234,7 @@ body::before {
     },
 
     analyze: function(params) {
-      return fetch('/api/analyze', {
+      return API.fetch('/api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(params)
@@ -2161,7 +2245,7 @@ body::before {
     },
 
     transcode: function(params) {
-      return fetch('/api/transcode', {
+      return API.fetch('/api/transcode', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(params)
@@ -2171,36 +2255,44 @@ body::before {
       });
     },
 
+    health: function() {
+      return fetch('/api/health').then(function(r) { return r.json(); });
+    },
+
+    capabilities: function() {
+      return API.fetch('/api/capabilities').then(function(r) { return r.json(); });
+    },
+
     getJobs: function() {
-      return fetch('/api/jobs').then(function(r) {
+      return API.fetch('/api/jobs').then(function(r) {
         if (!r.ok) throw new Error('Failed to fetch jobs');
         return r.json();
       });
     },
 
     getJobFiles: function(id) {
-      return fetch('/api/jobs/' + encodeURIComponent(id) + '/files').then(function(r) {
+      return API.fetch('/api/jobs/' + encodeURIComponent(id) + '/files').then(function(r) {
         if (!r.ok) throw new Error('Failed to fetch files');
         return r.json();
       });
     },
 
     cancelJob: function(id) {
-      return fetch('/api/jobs/' + encodeURIComponent(id), { method: 'DELETE' }).then(function(r) {
+      return API.fetch('/api/jobs/' + encodeURIComponent(id), { method: 'DELETE' }).then(function(r) {
         if (!r.ok) throw new Error('Failed to cancel');
         return r.json();
       });
     },
 
     clearJobs: function() {
-      return fetch('/api/jobs', { method: 'DELETE' }).then(function(r) {
+      return API.fetch('/api/jobs', { method: 'DELETE' }).then(function(r) {
         if (!r.ok) throw new Error('Failed to clear jobs');
         return r.json();
       });
     },
 
     importUrl: function(url) {
-      return fetch('/api/url-import', {
+      return API.fetch('/api/url-import', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: url })
@@ -2210,18 +2302,36 @@ body::before {
       });
     },
 
-    downloadUrl: function(jobId, filename) {
-      return '/api/download/' + encodeURIComponent(jobId) + '/' + encodeURIComponent(filename);
+    /* A download is a plain navigation and cannot carry a header, so the key is
+     * traded for a short-lived single-use ticket bound to this one file. */
+    download: function(jobId, filename) {
+      return API.fetch('/api/download-ticket', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jobId: jobId, filename: filename })
+      }).then(function(r) {
+        if (!r.ok) throw new Error('Download not available');
+        return r.json();
+      }).then(function(d) {
+        var a = document.createElement('a');
+        a.href = '/api/download/' + encodeURIComponent(jobId) + '/' +
+                 encodeURIComponent(filename) + '?ticket=' + encodeURIComponent(d.ticket);
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+      });
     },
 
     clusterStatus: function(master) {
       var q = master ? '?master=' + encodeURIComponent(master) : '';
-      return fetch('/api/cluster/status' + q).then(function(r) { return r.json(); });
+      return API.fetch('/api/cluster/status' + q).then(function(r) { return r.json(); });
     },
 
     clusterTranscode: function(master, params) {
-      var body = Object.assign({}, params, master ? { master: master } : {});
-      return fetch('/api/cluster/transcode', {
+      /* The cluster assembler only ever produces MP4. */
+      var body = Object.assign({}, params, { format: 'mp4' }, master ? { master: master } : {});
+      return API.fetch('/api/cluster/transcode', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body)
@@ -2232,11 +2342,11 @@ body::before {
     },
 
     workersStatus: function() {
-      return fetch('/api/cluster/workers').then(function(r) { return r.json(); });
+      return API.fetch('/api/cluster/workers').then(function(r) { return r.json(); });
     },
 
     workersScale: function(replicas) {
-      return fetch('/api/cluster/workers/scale', {
+      return API.fetch('/api/cluster/workers/scale', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ replicas: replicas })
@@ -2257,11 +2367,25 @@ body::before {
     subs: new Set(),
 
     connect: function() {
+      /* When this deployment requires a key, a socket without one is closed by
+       * the server on arrival: skipping the attempt avoids a reconnect storm
+       * and stops a redundant "no key" notice from overwriting the more
+       * specific rejection message. The desktop build requires no key, so it
+       * must still connect — otherwise it loses live job progress. */
+      if (Auth.required && !Auth.key()) { UI.setWs(false); return; }
+
+      /* Bound at creation, not at onopen: a concurrent 401 on another request
+       * can clear storage in between, and reading it back there would send an
+       * empty key and then misreport the rejection as "no key supplied". */
+      var connKey = Auth.key();
       var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
       try { WS.socket = new WebSocket(proto + '//' + location.host + '/ws'); }
       catch (e) { WS._retry(); return; }
 
       WS.socket.onopen = function() {
+        /* The server drops any socket whose first frame is not a valid auth
+         * frame, so this must precede every subscribe. */
+        WS._send({ type: 'auth', key: connKey });
         UI.setWs(true);
         WS.subs.forEach(function(id) { WS._send({ type: 'subscribe', jobId: id }); });
       };
@@ -2270,13 +2394,40 @@ body::before {
         try { WS._handle(JSON.parse(ev.data)); } catch (e) {}
       };
 
-      WS.socket.onclose = function() { UI.setWs(false); WS._retry(); };
+      WS.socket.onclose = function(ev) {
+        UI.setWs(false);
+        /* 4401 means the key is wrong or missing — reconnecting once a second
+         * would just hammer the server, so prompt instead. */
+        if (ev && ev.code === 4401) {
+          Auth.clearKey();
+          if (Auth.onUnauthorized) Auth.onUnauthorized(!!connKey);
+          return;
+        }
+        WS._retry();
+      };
       WS.socket.onerror = function() { UI.setWs(false); };
     },
 
     subscribe: function(id) {
       WS.subs.add(id);
       WS._send({ type: 'subscribe', jobId: id });
+    },
+
+    /* Replace the current connection. Without detaching onclose first, the old
+     * socket's close handler still runs — and if it closed 4401 it would clear
+     * the key the user just typed. A pending retry timer would also race in a
+     * third socket. */
+    reconnect: function() {
+      clearTimeout(WS.timer);
+      WS.timer = null;
+      if (WS.socket) {
+        WS.socket.onclose = null;
+        WS.socket.onerror = null;
+        WS.socket.onmessage = null;
+        try { WS.socket.close(); } catch (e) {}
+        WS.socket = null;
+      }
+      WS.connect();
     },
 
     _send: function(d) {
@@ -2348,7 +2499,8 @@ body::before {
 
   /** Detect server platform and hide encoder options for wrong OS. */
   function detectPlatformEncoders() {
-    fetch('/api/health').then(function(r) { return r.json(); }).then(function(data) {
+    /* platform moved off /api/health, which is an unauthenticated probe. */
+    API.capabilities().then(function(data) {
       var isMac = data.platform === 'darwin';
       var isLinux = data.platform === 'linux';
       // Hide macOS-only encoders on Linux and vice versa
@@ -2360,7 +2512,26 @@ body::before {
         el.style.display = isLinux ? '' : 'none';
         el.disabled = !isLinux;
       });
-    }).catch(function() { /* offline — show all options */ });
+    }).catch(function() { /* offline or unauthenticated — show all options */ });
+  }
+
+  /** Hide the local-only controls when the deployment ships no coordinator. */
+  function applyLocalModeAvailability(localMode) {
+    if (localMode !== false) return;
+    var hide = ['btnAnalyze', 'optWorkers'];
+    hide.forEach(function(id) {
+      var el = document.getElementById(id);
+      if (!el) return;
+      var row = el.closest('.field-row') || el.closest('.actions') || el;
+      (row === el ? el : row).style.display = 'none';
+    });
+    var localPane = document.querySelector('.cluster-pane[data-pane="local"]');
+    if (localPane) localPane.style.display = 'none';
+    var offBtn = document.querySelector('.cluster-mode-btn[data-mode="off"]');
+    if (offBtn) {
+      offBtn.disabled = true;
+      offBtn.title = 'Local transcoding is not available in this deployment';
+    }
   }
 
   /** Update UI hints when encoder changes (CRF range, preset labels, visibility). */
@@ -2682,17 +2853,30 @@ body::before {
       var active = (phase !== 'complete' && phase !== 'error' && phase !== 'cancelled');
       cancelBtn.style.display = active ? 'inline-flex' : 'none';
 
-      // Downloads
+      // Downloads. These are buttons, not plain links: the file is fetched
+      // with a one-shot ticket minted from the API key, because an <a href>
+      // navigation cannot carry the authentication header.
       if (phase === 'complete' && job.outputFiles && job.outputFiles.length > 0) {
         var lh = '';
         job.outputFiles.forEach(function(f) {
           var name = typeof f === 'string' ? f : f.name || f.filename || '';
           if (!name) return;
-          lh += '<a class="download-link" href="' + esc(API.downloadUrl(jobId, name)) +
-                '" download="' + esc(name) + '">' + esc(name) + '</a>';
+          lh += '<button type="button" class="download-link" data-role="download" data-file="' +
+                esc(name) + '">' + esc(name) + '</button>';
         });
         dlLinks.innerHTML = lh;
         dlLinks.style.display = lh ? 'flex' : 'none';
+        dlLinks.querySelectorAll('[data-role="download"]').forEach(function(btn) {
+          btn.addEventListener('click', function() {
+            btn.disabled = true;
+            API.download(jobId, btn.getAttribute('data-file'))
+              .catch(function(err) {
+                console.error('Download error:', err);
+                alert('Download failed: ' + err.message);
+              })
+              .then(function() { btn.disabled = false; });
+          });
+        });
       }
     },
 
@@ -3389,13 +3573,85 @@ body::before {
     jobs: new Map(),
 
     init: function() {
+      App.initAuth();
       UI.init();
       UI.bind();
-      WS.connect();
       Cluster.init();
       Workers.init();
-      App.loadJobs();
       setInterval(function() { UI.tickStats(); }, 1000);
+      /* health is unauthenticated, so this resolves even before a key is
+       * entered. It settles two things the rest of boot depends on: whether a
+       * key is required at all (the desktop build has none) and whether the
+       * local-transcode controls are usable. Connect only after it answers, so
+       * the desktop build is never mistaken for an unauthenticated browser. */
+      API.health()
+        .then(function(h) {
+          if (h && h.authRequired === false) Auth.required = false;
+          applyLocalModeAvailability(h && h.localMode);
+          App.applyAuthRequirement();
+        })
+        .catch(function() {})
+        .then(function() {
+          WS.connect();
+          App.loadJobs();
+        });
+    },
+
+    /** Hide the key panel entirely where no key exists to enter. */
+    applyAuthRequirement: function() {
+      if (Auth.required) return;
+      var section = document.getElementById('authSection');
+      if (section) section.style.display = 'none';
+    },
+
+    initAuth: function() {
+      var apiInput = document.getElementById('apiKey');
+      var adminInput = document.getElementById('adminKey');
+      var help = document.getElementById('authHelp');
+      if (!apiInput || !adminInput) return;
+
+      var PROMPT = 'Enter the API key for this deployment to load jobs.';
+      var STORED = 'API key is kept in this browser; the admin key only until this tab closes. Both are sent as request headers.';
+      var REJECTED = 'API key rejected — enter a valid key to continue.';
+      /* Once a key has been rejected the notice sticks until the user edits
+       * the field. Polling callers (worker status, cluster status) keep
+       * 401ing after the key is cleared, and each of those carries no key, so
+       * a non-sticky message would immediately downgrade to the generic
+       * prompt and hide why access stopped. */
+      var rejected = false;
+      var setHelp = function(text) {
+        if (!help) return;
+        if (rejected && text !== REJECTED) return;
+        help.textContent = text;
+      };
+
+      apiInput.value = Auth.key();
+      adminInput.value = Auth.adminKey();
+      apiInput.addEventListener('change', function() {
+        var entered = apiInput.value.trim();
+        Auth.set(Auth.KEY_ITEM, entered);
+        rejected = false;
+        setHelp(entered ? STORED : PROMPT);
+        WS.reconnect();
+        App.loadJobs();
+      });
+      adminInput.addEventListener('change', function() {
+        Auth.set(Auth.ADMIN_ITEM, adminInput.value.trim());
+      });
+
+      Auth.onUnauthorized = function(hadKey) {
+        apiInput.value = '';
+        // Only call it a rejection if a key was actually presented; on a cold
+        // load with no key at all, the honest message is the prompt.
+        if (hadKey) {
+          rejected = true;
+          setHelp(REJECTED);
+        } else {
+          setHelp(PROMPT);
+        }
+        apiInput.focus();
+      };
+      if (!Auth.key()) setHelp(PROMPT);
     },
 
     loadJobs: function() {
