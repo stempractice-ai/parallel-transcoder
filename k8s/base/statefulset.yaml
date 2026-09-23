@@ -17,6 +17,11 @@ spec:
         app.kubernetes.io/name: transcoder-node
     spec:
       serviceAccountName: transcoder-node
+      # The daemon never calls the Kubernetes API, so it gets no token.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
       terminationGracePeriodSeconds: 30
       # Spread pods across hosts so one node going down doesn't take the
       # whole cluster with it.
@@ -31,6 +36,11 @@ spec:
         - name: transcoder-node
           image: transcoder-node:dev
           imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           # Pod ordinal drives the master/worker split. Pod-0 bootstraps as
           # master; all others --join transcoder-node-0.<svc> on boot.
           # The shell wrapper extracts the ordinal from POD_NAME before

@@ -9,6 +9,10 @@ jobs:
   node:
     name: Node ${{ matrix.node }}
     runs-on: ubuntu-latest
+    # No test loads Electron, so skip the binary its postinstall downloads on
+    # every `npm ci`.
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
     strategy:
       # Both legs must report: 20 is the floor the production image runs
       # (Dockerfile.web uses node:20-slim), 24 is what developers run locally.
@@ -23,6 +27,17 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
       - run: npm ci
+      # The manifest policy test renders overlays with `kubectl kustomize` only
+      # (offline; it pins KUBECONFIG=/dev/null). Official binary, checksum-verified,
+      # so no third-party action is involved.
+      - name: Install kubectl
+        run: |
+          KV=v1.36.1
+          curl -fsSLO "https://dl.k8s.io/release/${KV}/bin/linux/amd64/kubectl"
+          curl -fsSLO "https://dl.k8s.io/release/${KV}/bin/linux/amd64/kubectl.sha256"
+          echo "$(cat kubectl.sha256)  kubectl" | sha256sum --check
+          sudo install -m 0755 kubectl /usr/local/bin/kubectl
+          rm kubectl kubectl.sha256
       # Bare `node --test` on purpose: a quoted glob argument is a hard error
       # on Node 20 ("Could not find …", exit 1) while positional paths are
       # interpreted differently on 20 and 24. Default discovery behaves

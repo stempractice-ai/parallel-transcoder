@@ -23,12 +23,20 @@ spec:
         app.kubernetes.io/name: transcoder-web
     spec:
       serviceAccountName: transcoder-web
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
       imagePullSecrets:
         - name: ocir-secret
       containers:
         - name: transcoder-web
           image: transcoder-web:dev
           imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           env:
             - name: PORT
               value: "3000"
@@ -118,6 +126,12 @@ spec:
                 secretKeyRef:
                   name: transcoder-web-auth
                   key: admin-key
+            # The root filesystem is read-only: uploads and outputs live on the
+            # single emptyDir OKE virtual nodes allow per pod (in-cluster the
+            # server writes no pid file). Requires transcoder-web >= v0.1.16,
+            # which introduced this knob.
+            - name: TRANSCODER_STATE_DIR
+              value: /var/lib/transcoder-web
           ports:
             - name: http
               containerPort: 3000
@@ -152,6 +166,8 @@ spec:
             - name: oci-scaler-key
               mountPath: /var/run/secrets/oci-scaler
               readOnly: true
+            - name: state
+              mountPath: /var/lib/transcoder-web
       volumes:
         - name: oci-scaler-key
           secret:
@@ -159,6 +175,12 @@ spec:
             items:
               - key: private-key
                 path: private-key
+        # Exactly one emptyDir: virtual nodes allow at most one per pod and
+        # reject sizeLimit. Default (disk) medium, because uploads can be
+        # gigabytes and must not count against the 256Mi memory limit; it draws
+        # on the same 15 GB per-pod allocation the writable root used to.
+        - name: state
+          emptyDir: {}
 ---
 # ClusterIP only — external exposure is via the Native Ingress Controller
 # (web-ingress.yaml), since type:LoadBalancer registers an unreachable

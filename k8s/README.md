@@ -9,11 +9,20 @@ k8s/
 ├── base/              # StatefulSet + headless Service + master Service +
 │                      # ConfigMap + ServiceAccount — no assumptions about
 │                      # node pools, GPU, or object storage.
-└── overlays/
-    ├── kind/          # Local dev on kind: in-cluster MinIO, CPU-only
-    │                  # encoder, tight resource limits.
-    └── cloud/         # EKS/GKE: NVIDIA + VAAPI + AVX-512 node pools
-                       # selected via NFD labels, S3 via IRSA / Workload Identity.
+├── overlays/
+│   ├── kind/          # Local dev on kind: in-cluster MinIO, CPU-only
+│   │                  # encoder, tight resource limits.
+│   ├── cloud/         # EKS/GKE: NVIDIA + VAAPI + AVX-512 node pools
+│   │                  # selected via NFD labels, S3 via IRSA / Workload Identity.
+│   └── oci-a1/        # OKE virtual nodes (pt1-cluster): master, CPU workers,
+│                      # web UI behind the OCI Native Ingress Controller.
+├── components/
+│   └── managed-node-hardening/  # NetworkPolicy + seccomp. Managed nodes only;
+│                                # no overlay includes it.
+├── fixtures/
+│   └── oci-a1-managed-nodes/    # Test-only render: oci-a1 + that component.
+└── probes/
+    └── readonly-root-probe.yaml # One-shot Job for the Wave 2 runbook below.
 ```
 
 ## Kind workflow
@@ -116,3 +125,63 @@ authentication because the kubelet cannot send headers.
 
 Every step above changes production and is run by the cluster owner, after written approval — not by
 whoever wrote the code.
+
+### Applying the Wave 2 posture
+
+Every command below changes or reads production. The cluster owner runs them, after written
+approval.
+
+The manifests run every transcoder container as uid 10001 with a read-only root filesystem, no
+privilege escalation and no Linux capabilities, and mount no service-account token into the node
+pods. The web pod keeps uploads and outputs on its single `emptyDir` (`TRANSCODER_STATE_DIR`). Only
+fields OKE virtual nodes honour are used: NetworkPolicy and seccomp live in
+`components/managed-node-hardening`, which no overlay includes, because virtual nodes do not
+support them.
+
+Apply while no transcode job is running: the master pod restarts.
+
+```bash
+# Prerequisite: transcoder-web v0.1.16 is built and pushed (see Release order).
+# These manifests must never run with an older web image: it writes a pid file
+# into the now read-only root and crash-loops.
+kubectl diff -k k8s/overlays/oci-a1                       # preview
+kubectl apply -k k8s/overlays/oci-a1
+kubectl -n transcoder rollout status statefulset/transcoder-node
+kubectl -n transcoder rollout status deploy/transcoder-web
+# No read-only-filesystem errors. Virtual nodes support `logs`, not `logs -f`.
+for p in $(kubectl -n transcoder get pods -o name); do
+  kubectl -n transcoder logs "$p" | grep -iE 'EROFS|read-only file system' && echo "^^ $p"
+done
+# The fields were accepted and persisted on the pod object
+kubectl -n transcoder get pod -l app.kubernetes.io/name=transcoder-web \
+  -o jsonpath='{.items[0].spec.containers[0].securityContext}'
+# Enforcement, not just acceptance
+kubectl apply -f k8s/probes/readonly-root-probe.yaml
+kubectl -n transcoder wait --for=condition=complete job/readonly-root-probe --timeout=180s
+kubectl -n transcoder logs job/readonly-root-probe        # expect ROOT_READONLY and SCRATCH_WRITABLE
+kubectl -n transcoder delete job readonly-root-probe     # bills until deleted
+```
+
+Delete the probe Job even if the wait times out: `ttlSecondsAfterFinished` only removes a Job that
+finished. `kubectl exec` and `port-forward` are not available on virtual nodes, which is why the
+check is a Job.
+
+Reading the probe:
+
+- `ROOT_READONLY` and `SCRATCH_WRITABLE`: the control is enforced.
+- `ROOT_WRITABLE`: virtual nodes accept `readOnlyRootFilesystem` but do not enforce it. Record
+  that, leave the field (it is harmless), and stop claiming the control on this cluster.
+- `SCRATCH_NOT_WRITABLE`: uid 10001 cannot write its `emptyDir`, so the daemons cannot work. Roll
+  back.
+
+Rollback:
+
+```bash
+kubectl -n transcoder rollout undo deploy/transcoder-web
+kubectl -n transcoder rollout undo statefulset/transcoder-node
+kubectl -n transcoder rollout undo deploy/transcoder-worker-cpu
+```
+
+`rollout undo` restores the previous pod templates in the cluster only; the next
+`kubectl apply -k` reinstates these manifests unless the commit is reverted too. Rolling
+`transcoder-web` back below v0.1.16 means rolling these manifests back with it.

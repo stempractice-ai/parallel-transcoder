@@ -37,7 +37,8 @@
   },
   "devDependencies": {
     "electron": "^33.0.0",
-    "electron-builder": "^25.0.0"
+    "electron-builder": "^25.0.0",
+    "js-yaml": "4.3.2"
   },
   "engines": {
     "node": ">=20.0.0"

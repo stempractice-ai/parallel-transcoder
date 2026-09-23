@@ -1,0 +1,49 @@
+# Proves the virtual node ENFORCES readOnlyRootFilesystem rather than merely
+# accepting the field. kubectl exec is unavailable on virtual nodes, so the
+# check runs as a Job. Virtual-node Jobs bill until deleted: the runbook
+# deletes it, and ttlSecondsAfterFinished is the backstop.
+#
+# Referenced by no kustomization, so `kubectl apply -k` never picks it up. Run
+# only as part of the owner runbook in k8s/README.md.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: readonly-root-probe
+  namespace: transcoder
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: ocir-secret
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+      containers:
+        - name: probe
+          # The node image already in OCIR, so the probe does not wait on a new
+          # release.
+          image: iad.ocir.io/idr5qsmifndm/transcoder-node:v0.1.10
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              if touch /var/lib/transcoder/probe 2>/dev/null; then echo ROOT_WRITABLE; else echo ROOT_READONLY; fi
+              if touch /var/lib/transcoder/tmp/probe; then echo SCRATCH_WRITABLE; else echo SCRATCH_NOT_WRITABLE; fi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          # Oracle's per-pod minimum on virtual nodes.
+          resources:
+            requests: { cpu: "125m", memory: "512Mi" }
+            limits: { cpu: "125m", memory: "512Mi" }
+          volumeMounts:
+            - name: scratch
+              mountPath: /var/lib/transcoder/tmp
+      volumes:
+        - name: scratch
+          emptyDir: {}

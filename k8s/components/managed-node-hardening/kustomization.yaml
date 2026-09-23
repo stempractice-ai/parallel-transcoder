@@ -1,0 +1,28 @@
+# Hardening that works only on MANAGED nodes. OKE virtual nodes — which
+# pt1-cluster runs today — support neither NetworkPolicy nor a pod
+# seccompProfile; applied there, these are rejected or, worse, accepted and
+# enforced by nothing. Include this component only from an overlay running on
+# managed nodes with a NetworkPolicy-enforcing CNI such as Calico.
+#
+# The seccomp patches target every Deployment and StatefulSet and add into an
+# existing pod securityContext, so the including overlay must already set one
+# on each workload (oci-a1 does). Rendering fails loudly where it does not.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources:
+  - networkpolicy.yaml
+patches:
+  - target:
+      kind: Deployment
+    patch: |-
+      - op: add
+        path: /spec/template/spec/securityContext/seccompProfile
+        value:
+          type: RuntimeDefault
+  - target:
+      kind: StatefulSet
+    patch: |-
+      - op: add
+        path: /spec/template/spec/securityContext/seccompProfile
+        value:
+          type: RuntimeDefault
