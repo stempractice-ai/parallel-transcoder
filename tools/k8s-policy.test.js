@@ -109,6 +109,12 @@ const VIRTUAL_NODE_CASES = {
     ["readinessProbe", (_p, c) => { c.readinessProbe = { grpc: { port: 3000 } }; }],
     ["startupProbe", (_p, c) => { c.startupProbe = { grpc: { port: 3000 } }; }],
   ],
+  "vn/volume-mode": [
+    ["secret defaultMode 0400 as js-yaml reads a raw file (400)", (p) => p.volumes.push({ name: "key", secret: { secretName: "s", defaultMode: 400 } })],
+    ["secret item mode 0400 written in decimal", (p) => p.volumes.push({ name: "key", secret: { secretName: "s", items: [{ key: "k", path: "k", mode: 256 }] } })],
+    ["configMap defaultMode 0600", (p) => p.volumes.push({ name: "cfg", configMap: { name: "c", defaultMode: 384 } })],
+    ["projected secret item mode 0400", (p) => p.volumes.push({ name: "proj", projected: { sources: [{ secret: { name: "s", items: [{ key: "k", path: "k", mode: 256 }] } }] } })],
+  ],
 };
 
 for (const [rule, cases] of Object.entries(VIRTUAL_NODE_CASES)) {
@@ -124,6 +130,15 @@ for (const [rule, cases] of Object.entries(VIRTUAL_NODE_CASES)) {
 test("a Memory-backed emptyDir is allowed on virtual nodes", () => {
   const pod = goodPod();
   pod.volumes[0].emptyDir.medium = "Memory";
+  assert.deepEqual(virtualNodeViolations(pod), []);
+});
+
+test("a 0644 volume mode is allowed on virtual nodes", () => {
+  const pod = goodPod();
+  pod.volumes.push(
+    { name: "key", secret: { secretName: "s", defaultMode: 420 } },
+    { name: "cfg", configMap: { name: "c", items: [{ key: "k", path: "k", mode: 420 }] } },
+  );
   assert.deepEqual(virtualNodeViolations(pod), []);
 });
 

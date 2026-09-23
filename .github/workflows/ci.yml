@@ -28,16 +28,17 @@ jobs:
           node-version: ${{ matrix.node }}
       - run: npm ci
       # The manifest policy test renders overlays with `kubectl kustomize` only
-      # (offline; it pins KUBECONFIG=/dev/null). Official binary, checksum-verified,
-      # so no third-party action is involved.
+      # (offline; it pins KUBECONFIG=/dev/null). Official binary, checked against
+      # a digest pinned here rather than one fetched from the same host at run
+      # time; bumping KV means updating KUBECTL_SHA256 in the same edit.
       - name: Install kubectl
         run: |
           KV=v1.36.1
+          KUBECTL_SHA256=629d3f410e09bf49b64ae7079f7f0bda1191efed311f7d37fdbab0ad5b0ec2b7
           curl -fsSLO "https://dl.k8s.io/release/${KV}/bin/linux/amd64/kubectl"
-          curl -fsSLO "https://dl.k8s.io/release/${KV}/bin/linux/amd64/kubectl.sha256"
-          echo "$(cat kubectl.sha256)  kubectl" | sha256sum --check
+          echo "${KUBECTL_SHA256}  kubectl" | sha256sum --check
           sudo install -m 0755 kubectl /usr/local/bin/kubectl
-          rm kubectl kubectl.sha256
+          rm kubectl
       # Bare `node --test` on purpose: a quoted glob argument is a hard error
       # on Node 20 ("Could not find …", exit 1) while positional paths are
       # interpreted differently on 20 and 24. Default discovery behaves

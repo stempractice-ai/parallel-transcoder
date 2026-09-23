@@ -17,9 +17,9 @@ import { loadAll } from "js-yaml";
 
 export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
-// Every kubectl call here is offline: the subcommands are literals and
-// KUBECONFIG points at an empty file, so no edit to this module can make it
-// reach a cluster.
+// Callers cannot make these calls reach a cluster: both kubectl subcommands
+// are literals (`version --client`, `kustomize`) and KUBECONFIG is pinned to
+// an empty file.
 const KUBECTL_ENV = { ...process.env, KUBECONFIG: "/dev/null" };
 
 export const KUBECTL_AVAILABLE =
@@ -58,8 +58,8 @@ export function podTemplates(docs) {
     }));
 }
 
-// Virtual-node restrictions a pod template can violate, one rule per Oracle
-// restriction:
+// Oracle's virtual-node restrictions that these manifests could plausibly hit,
+// one rule each:
 //
 //   vn/multiple-emptydir         more than one emptyDir volume
 //   vn/emptydir-options          emptyDir sizeLimit, or medium other than "" / "Memory"
@@ -71,10 +71,19 @@ export function podTemplates(docs) {
 //   vn/hostport                  a container port with hostPort or hostIP
 //   vn/init-containers           any init container
 //   vn/grpc-probe                a gRPC liveness/readiness/startup probe
+//   vn/volume-mode               a Secret/ConfigMap/projected volume mode other than 0644
 //
 // terminationGracePeriodSeconds is also on Oracle's list but is deliberately
 // NOT a rule: production renders it today and the pods run, so the virtual
 // kubelet ignores it rather than rejecting it. Removing it is outside Wave 2.
+//
+// Oracle's table has more restrictions than these; nothing here comes near
+// the rest, so they are not encoded: DaemonSets, ephemeral containers,
+// stdin/tty, local/nfs/iscsi/cephfs volumes, hostname, setHostnameAsFQDN, os,
+// overhead, terminationMessagePath/Policy, volumeDevices, mountPropagation,
+// subPathExpr, container ports in the NodePort range 30000-32767, downwardAPI
+// resourceFieldRef, projected token expirationSeconds and probe-level
+// terminationGracePeriodSeconds.
 const VN_POD_SECURITY_FIELDS = [
   "seccompProfile",
   "fsGroup",
@@ -85,6 +94,10 @@ const VN_POD_SECURITY_FIELDS = [
 ];
 const VN_HOST_FIELDS = ["hostNetwork", "hostIPC", "hostPID", "shareProcessNamespace"];
 const PROBES = ["livenessProbe", "readinessProbe", "startupProbe"];
+// Oracle allows Secret, ConfigMap and projected volume modes of 0644 only.
+// kustomize normalises the YAML literal 0644 to 420, which is also how
+// Kubernetes reads it.
+const VN_ALLOWED_MODES = new Set([420]);
 
 export function virtualNodeViolations(spec) {
   const out = [];
@@ -100,6 +113,19 @@ export function virtualNodeViolations(spec) {
   }
   for (const v of volumes) {
     if (v.hostPath != null) flag("vn/hostpath", v.name);
+    const sources = [v.secret, v.configMap, v.projected];
+    for (const s of v.projected?.sources ?? []) sources.push(s.secret, s.configMap);
+    for (const src of sources) {
+      if (src == null) continue;
+      if (src.defaultMode !== undefined && !VN_ALLOWED_MODES.has(src.defaultMode)) {
+        flag("vn/volume-mode", `${v.name}: defaultMode ${src.defaultMode}`);
+      }
+      for (const item of src.items ?? []) {
+        if (item.mode !== undefined && !VN_ALLOWED_MODES.has(item.mode)) {
+          flag("vn/volume-mode", `${v.name}: ${item.key} mode ${item.mode}`);
+        }
+      }
+    }
   }
 
   const podSecurity = spec.securityContext ?? {};
