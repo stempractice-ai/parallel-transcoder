@@ -133,13 +133,27 @@ test("a Memory-backed emptyDir is allowed on virtual nodes", () => {
   assert.deepEqual(virtualNodeViolations(pod), []);
 });
 
-test("a 0644 volume mode is allowed on virtual nodes", () => {
+test("a 0644 or unset volume mode is allowed on virtual nodes", () => {
   const pod = goodPod();
   pod.volumes.push(
     { name: "key", secret: { secretName: "s", defaultMode: 420 } },
+    { name: "raw", secret: { secretName: "s", defaultMode: 644 } },
+    { name: "plain", secret: { secretName: "s" } },
     { name: "cfg", configMap: { name: "c", items: [{ key: "k", path: "k", mode: 420 }] } },
   );
   assert.deepEqual(virtualNodeViolations(pod), []);
+});
+
+// Raw files (the probe) reach the checker through js-yaml, not kustomize, and
+// js-yaml 4 reads a leading-zero literal as decimal.
+test("volume modes are judged as js-yaml reads each YAML spelling", () => {
+  const rules = (literal) => {
+    const pod = goodPod();
+    pod.volumes.push(loadAll(`name: key\nsecret: {secretName: s, defaultMode: ${literal}}`)[0]);
+    return virtualNodeViolations(pod).map((f) => f.rule);
+  };
+  for (const ok of ["0644", "420", "0o644"]) assert.deepEqual(rules(ok), [], ok);
+  for (const bad of ["0400", "0o400", "256", "0600"]) assert.deepEqual(rules(bad), ["vn/volume-mode"], bad);
 });
 
 const HARDENING_CASES = {

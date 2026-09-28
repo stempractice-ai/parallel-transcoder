@@ -95,9 +95,11 @@ const VN_POD_SECURITY_FIELDS = [
 const VN_HOST_FIELDS = ["hostNetwork", "hostIPC", "hostPID", "shareProcessNamespace"];
 const PROBES = ["livenessProbe", "readinessProbe", "startupProbe"];
 // Oracle allows Secret, ConfigMap and projected volume modes of 0644 only.
-// kustomize normalises the YAML literal 0644 to 420, which is also how
-// Kubernetes reads it.
-const VN_ALLOWED_MODES = new Set([420]);
+// kustomize renders the YAML literal 0644 as 420, which is how Kubernetes
+// reads it; raw files loaded with js-yaml 4 (YAML 1.2) read the same literal
+// as decimal 644. Decimal 644 exceeds 0777 and the API rejects it, so
+// accepting it cannot let any other mode through.
+const VN_ALLOWED_MODES = new Set([420, 644]);
 
 export function virtualNodeViolations(spec) {
   const out = [];
