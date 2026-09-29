@@ -175,8 +175,19 @@ fn receive_and_write(
     Ok(())
 }
 
-/// Stream-copy one audio packet from input to output — no decode/re-encode,
-/// just timestamp rescaling and remuxing onto the output audio stream.
+/// `origin_secs` expressed in ticks of a `tb_num/tb_den` time base.
+fn origin_ticks(origin_secs: f64, tb_num: i32, tb_den: i32) -> i64 {
+    (origin_secs * f64::from(tb_den) / f64::from(tb_num)).round() as i64
+}
+
+/// `ts` re-based to `origin`, or None if it falls before the origin.
+fn rebase_ts(ts: i64, origin: i64) -> Option<i64> {
+    let t = ts - origin;
+    (t >= 0).then_some(t)
+}
+
+/// Stream-copy one audio packet from input to output: no re-encode, just
+/// re-basing onto the video's time origin and remuxing.
 /// Outside presplit mode, packets outside the segment's time window are
 /// dropped to match the video path's frame filtering.
 fn copy_audio_packet(
@@ -185,6 +196,7 @@ fn copy_audio_packet(
     output_stream_index: usize,
     presplit: bool,
     segment: &SegmentDescriptor,
+    origin_secs: f64,
     octx: &mut format::context::Output,
 ) -> Result<()> {
     if !presplit {
@@ -195,6 +207,19 @@ fn copy_audio_packet(
                 return Ok(());
             }
         }
+    }
+    // Output video timestamps count frames from 0 (process_frame), so audio
+    // must be measured from the same instant or it drifts by the input's
+    // start offset (about 1.4 s on an MPEG-TS segment).
+    let origin = origin_ticks(origin_secs, input_tb.numerator(), input_tb.denominator());
+    if let Some(pts) = packet.pts() {
+        match rebase_ts(pts, origin) {
+            Some(p) => packet.set_pts(Some(p)),
+            None => return Ok(()),
+        }
+    }
+    if let Some(dts) = packet.dts() {
+        packet.set_dts(Some(dts - origin));
     }
     let output_tb = octx.stream(output_stream_index).unwrap().time_base();
     packet.rescale_ts(input_tb, output_tb);
@@ -222,6 +247,19 @@ fn transcode_segment(
 
     let video_stream_index = input_stream.index();
     let input_time_base = input_stream.time_base();
+    // The instant output video frame 0 stands for: the video stream's start
+    // on a presplit segment, the segment's start when seeking the full source.
+    let video_origin_secs = if presplit {
+        let start = input_stream.start_time();
+        if start == sys::AV_NOPTS_VALUE {
+            0.0
+        } else {
+            start as f64 * f64::from(input_time_base.numerator())
+                / f64::from(input_time_base.denominator())
+        }
+    } else {
+        segment.start_timestamp
+    };
     let avg_frame_rate = input_stream.avg_frame_rate();
 
     let codec_params = input_stream.parameters();
@@ -560,7 +598,15 @@ fn transcode_segment(
         if stream_index != video_stream_index {
             if let Some((audio_index, audio_tb, audio_out_index)) = audio_info {
                 if stream_index == audio_index {
-                    copy_audio_packet(packet, audio_tb, audio_out_index, presplit, segment, &mut octx)?;
+                    copy_audio_packet(
+                        packet,
+                        audio_tb,
+                        audio_out_index,
+                        presplit,
+                        segment,
+                        video_origin_secs,
+                        &mut octx,
+                    )?;
                 }
             }
             continue;
@@ -735,6 +781,20 @@ fn find_encoder(name: &str) -> anyhow::Result<ffmpeg::Codec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn origin_ticks_converts_seconds_to_the_stream_time_base() {
+        assert_eq!(origin_ticks(1.4, 1, 90_000), 126_000);
+        assert_eq!(origin_ticks(10.0, 1, 44_100), 441_000);
+        assert_eq!(origin_ticks(0.0, 1, 48_000), 0);
+    }
+
+    #[test]
+    fn rebase_ts_drops_audio_before_the_video_origin() {
+        assert_eq!(rebase_ts(131_104, 126_000), Some(5_104));
+        assert_eq!(rebase_ts(126_000, 126_000), Some(0));
+        assert_eq!(rebase_ts(125_999, 126_000), None);
+    }
 
     #[test]
     fn test_segment_descriptor_deserialize() {

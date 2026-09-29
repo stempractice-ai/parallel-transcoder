@@ -24,6 +24,11 @@ spec:
         pool: cpu-worker
     spec:
       serviceAccountName: transcoder-node
+      # The daemon never calls the Kubernetes API, so it gets no token.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
       terminationGracePeriodSeconds: 30
       imagePullSecrets:
         - name: ocir-secret
@@ -39,6 +44,11 @@ spec:
       containers:
         - name: transcoder-node
           image: transcoder-node:dev
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           # Shell wrapper (matching the StatefulSet's) so OBJECT_STORE_URL
           # actually reaches the CLI as --object-store-url — a plain exec
           # array here doesn't do env-to-flag substitution, so workers were

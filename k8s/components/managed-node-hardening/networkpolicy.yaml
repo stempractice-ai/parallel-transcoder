@@ -1,0 +1,58 @@
+# Default deny: selects every pod in the namespace, so the two allow policies
+# below are the complete list of ways in.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+# Cluster control plane (TCP 9900): node to node, and web to master for job
+# submission. The selector also covers the worker Deployments, which carry
+# app.kubernetes.io/name=transcoder-node too. No UDP: the SRT data plane
+# (9910-9930) has never carried traffic.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-control-plane
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: transcoder-node
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: transcoder-node
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: transcoder-web
+      ports:
+        - protocol: TCP
+          port: 9900
+---
+# User traffic reaches the web pod from the OCI load balancer's subnet, straight
+# to the pod IP. The OCI Native Ingress Controller only programs that load
+# balancer and never carries traffic itself, so admitting the controller's
+# namespace instead would black-hole every request.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-web-from-load-balancer
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: transcoder-web
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - ipBlock:
+            cidr: 10.0.20.0/24
+      ports:
+        - protocol: TCP
+          port: 3000

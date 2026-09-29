@@ -177,30 +177,73 @@ npm run web
 
 Full documentation: **[API.md](API.md)**
 
+All `/api/*` routes require `X-API-Key` except `/api/health` and `/api/ready`; the routes marked
+**admin** additionally require `X-Admin-Key`.
+
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/health` | GET | Server status, platform info |
+| `/api/health` | GET | Liveness — `{ status, localMode, authRequired }`. No key. |
+| `/api/ready` | GET | Readiness — 503 when local disk is exhausted. No key. |
+| `/api/capabilities` | GET | Server platform and arch, for encoder selection |
 | `/api/upload` | POST | Upload video (multipart) |
-| `/api/transcode` | POST | Start transcoding job |
-| `/api/analyze` | POST | Analyze video complexity |
+| `/api/url-import` | POST | Fetch a video from a public URL |
+| `/api/transcode` | POST | Start local transcoding job (501 where no coordinator ships) |
+| `/api/analyze` | POST | Analyze video complexity (501 where no coordinator ships) |
 | `/api/jobs` | GET | List all jobs |
+| `/api/jobs` | DELETE | **admin** — delete every job and its files |
 | `/api/jobs/:id` | GET | Job status and progress |
 | `/api/jobs/:id/logs` | GET | Paginated job logs |
 | `/api/jobs/:id/files` | GET | List output files |
-| `/api/download/:jobId/:file` | GET | Download output file |
 | `/api/jobs/:id` | DELETE | Cancel and remove job |
+| `/api/download-ticket` | POST | Mint a 60s single-use download grant for one file |
+| `/api/download/:jobId/:file` | GET | Download output file (`?ticket=` or `X-API-Key`) |
 | `/api/cluster/status` | GET | Cluster status |
 | `/api/cluster/nodes` | GET | List cluster nodes |
-| `/api/cluster/transcode` | POST | Submit cluster job |
+| `/api/cluster/transcode` | POST | Submit cluster job (MP4 only) |
+| `/api/cluster/workers` | GET | **admin** — worker replica status |
+| `/api/cluster/workers/scale` | POST | **admin** — scale workers and the node pool |
 
-**WebSocket:** `ws://localhost:3000/ws` — real-time progress, logs, and completion events.
+**WebSocket:** `ws://localhost:3000/ws` — real-time progress, logs, and completion events. The first
+frame must be `{"type":"auth","key":"<API key>"}`; the server replies `{"type":"auth-ok"}` or closes
+with code `4401`.
 
 ## Configuration
 
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
-| `PORT` | `3000` | Server listen port |
-| `TRANSCODER_API_KEY` | *(none)* | API key for authentication |
+| `PORT` | `3000` | Server listen port (`0` picks an ephemeral port and logs it) |
+| `TRANSCODER_API_KEY` | **required** outside desktop mode | Shared key every API and WebSocket call must present. The server exits 1 without it. |
+| `TRANSCODER_ADMIN_KEY` | *(none — admin routes return 403 until set)* | Second key for worker scaling and bulk job deletion |
+| `CLUSTER_MASTER` | `localhost:9900` | Cluster master `host:port`. Outside desktop mode this is the only master the server will talk to; per-request overrides are ignored. |
+| `TRANSCODER_STATE_DIR` | `web/` | Root for `uploads/`, `outputs/` and the pid file |
+| `CORS_ORIGINS` | *(none — no CORS headers at all)* | Comma-separated exact origins allowed to call the API cross-origin. Credentials are never allowed. |
+| `TRANSCODER_WS_AUTH_TIMEOUT_MS` | `5000` | How long an unauthenticated WebSocket may live before it is closed with code 4401 |
+| `DESKTOP_MODE` | *(unset)* | Set to `1` by the desktop app: binds loopback and requires no keys |
+
+### Authentication keys
+
+Two shared secrets, both generated locally and never committed:
+
+```bash
+openssl rand -hex 32   # TRANSCODER_API_KEY   — every client needs this
+openssl rand -hex 32   # TRANSCODER_ADMIN_KEY — only whoever may scale workers
+```
+
+Run locally:
+
+```bash
+TRANSCODER_API_KEY=$(openssl rand -hex 32) \
+TRANSCODER_ADMIN_KEY=$(openssl rand -hex 32) \
+npm run web
+```
+
+Paste the same values into the **Authentication** panel in the web UI. The API key is kept in the
+browser's `localStorage`; the admin key only in `sessionStorage`, so it is gone when the tab closes.
+The desktop app sets `DESKTOP_MODE=1` and needs neither.
+
+Rotate by changing the environment and restarting the server — every browser then prompts again.
+For Kubernetes, see [k8s/README.md](k8s/README.md): the keys come from a Secret that must exist
+*before* the pod starts, because the server refuses to boot without one.
 
 ### Encoding Parameters
 
