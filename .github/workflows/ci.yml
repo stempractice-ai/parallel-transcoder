@@ -14,11 +14,12 @@ jobs:
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
     strategy:
-      # Both legs must report: 20 is the floor the production image runs
-      # (Dockerfile.web uses node:20-slim), 24 is what developers run locally.
+      # Every leg must report: 20 is what the desktop build runs server.js on
+      # (Electron 33 embeds Node 20.18), 22 is the production image
+      # (Dockerfile.web uses node:22-slim), 24 is what developers run locally.
       fail-fast: false
       matrix:
-        node: ['20', '24']
+        node: ['20', '22', '24']
     steps:
       # Actions are pinned by commit SHA, not tag: a tag is mutable and an
       # action runs with access to this repository's token.
