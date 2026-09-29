@@ -1795,12 +1795,13 @@ mod tests {
     // from just before the frame in the next piece, so audio joined from the
     // pieces loses that much at each boundary; the source's audio must come
     // through whole and start with the video.
+    //
+    // Needs ffmpeg and ffprobe on PATH. CI's cluster-crate job has neither, so
+    // the test is ignored there and reported as such; run it in the Docker
+    // builder image with `cargo test -p transcoder-cluster -- --include-ignored`.
     #[tokio::test]
+    #[ignore = "needs ffmpeg; run in the builder image with --include-ignored"]
     async fn joined_output_carries_the_source_audio_whole_and_in_sync() {
-        if Command::new("ffmpeg").arg("-version").output().is_err() {
-            eprintln!("skipping: ffmpeg is not on PATH");
-            return;
-        }
         let dir = std::env::temp_dir().join(format!("join-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let source = dir.join("source.mp4");
