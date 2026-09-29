@@ -112,12 +112,17 @@ resize the billable virtual-node pool — give it only to whoever is allowed to 
 ### Release order
 
 ```bash
+docker buildx build --platform linux/arm64 -f Dockerfile \
+  -t iad.ocir.io/idr5qsmifndm/transcoder-node:<node-tag> --push .
+git tag node-<node-tag>
 docker buildx build --platform linux/arm64 -f Dockerfile.web \
   -t iad.ocir.io/idr5qsmifndm/transcoder-web:<tag> --push .
 git tag web-<tag>
 # create or rotate transcoder-web-auth (above) — must exist before the rollout
 kubectl apply -k k8s/overlays/oci-a1
 kubectl -n transcoder rollout status deploy/transcoder-web
+# a node tag change restarts the master; jobs in flight are lost
+kubectl -n transcoder rollout status statefulset/transcoder-node
 ```
 
 The probes point at `/api/ready` (readiness) and `/api/health` (liveness). Both are exempt from key

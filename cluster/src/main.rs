@@ -123,6 +123,12 @@ struct JobContext {
     /// SegmentComplete messages arrive. Used to assemble the final output
     /// once every segment is done.
     output_uris: HashMap<usize, String>,
+    /// Object-store URI of the uploaded source. Assembly takes the audio from
+    /// it: segments are cut on video keyframes, each carries some audio from
+    /// just before its first frame, and the worker drops that audio so its
+    /// output starts with the video. Audio joined from the segments would
+    /// therefore have a gap at every boundary.
+    source_uri: Option<String>,
 }
 
 /// Top-level application state shared across the event loop.
@@ -486,6 +492,7 @@ impl App {
                 input_filename: data.input_filename,
                 segments: segments.clone(),
                 output_uris: HashMap::new(),
+                source_uri: data.srt_input_url.filter(|u| is_s3_uri(u)),
             },
         );
 
@@ -845,8 +852,10 @@ impl App {
                 let (tx, rx) = mpsc::unbounded_channel();
                 self.pending_assembly.insert(job_id, rx);
                 let format = ctx.config.format.clone();
+                let source_uri = ctx.source_uri.clone();
                 tokio::spawn(async move {
-                    let outcome = assemble_output(&store, job_id, &format, uris).await;
+                    let outcome =
+                        assemble_output(&store, job_id, &format, uris, source_uri.as_deref()).await;
                     let _ = tx.send(AssemblyResult {
                         total_segments: total,
                         outcome,
@@ -1059,9 +1068,8 @@ async fn assemble_output(
     job_id: JobId,
     _format: &str,
     mut uris: Vec<(usize, String)>,
+    source_uri: Option<&str>,
 ) -> Result<String> {
-    use tokio::process::Command;
-
     uris.sort_by_key(|(id, _)| *id);
 
     let work_dir = std::env::temp_dir().join(format!("transcoder-assemble-{}", job_id));
@@ -1078,18 +1086,23 @@ async fn assemble_output(
     let list_path = work_dir.join("concat.txt");
     tokio::fs::write(&list_path, list_lines).await?;
 
+    let source_path = match source_uri {
+        Some(uri) => {
+            let ext = std::path::Path::new(uri.rsplit('/').next().unwrap_or_default())
+                .extension()
+                .map(|e| format!(".{}", e.to_string_lossy()))
+                .unwrap_or_default();
+            let path = work_dir.join(format!("source{}", ext));
+            ObjectStore::download_to_file(uri, store, &path)
+                .await
+                .with_context(|| format!("failed to download source for its audio {}", uri))?;
+            Some(path)
+        }
+        None => None,
+    };
+
     let output_path = work_dir.join("output.mp4");
-    let status = Command::new("ffmpeg")
-        .args(["-y", "-f", "concat", "-safe", "0", "-i"])
-        .arg(&list_path)
-        .args(["-c", "copy"])
-        .arg(&output_path)
-        .status()
-        .await
-        .context("failed to run ffmpeg concat")?;
-    if !status.success() {
-        anyhow::bail!("ffmpeg concat exited with {:?}", status.code());
-    }
+    join_segments(&list_path, source_path.as_deref(), &output_path).await?;
 
     let out_key = format!("jobs/{}/final/output.mp4", job_id);
     store
@@ -1100,6 +1113,43 @@ async fn assemble_output(
     tokio::fs::remove_dir_all(&work_dir).await.ok();
 
     Ok(store.build_uri(&out_key))
+}
+
+/// Join the encoded segments listed in `list_path` into `output_path`.
+///
+/// With `audio_source`, video comes from the segments and audio is copied
+/// from the source untouched, as the coordinator's `concatenate_mp4` does.
+/// Unlike there, no `-shortest`: a source whose audio ends early would
+/// otherwise lose its trailing video frames. Without a source, every stream
+/// is joined from the segments.
+async fn join_segments(
+    list_path: &std::path::Path,
+    audio_source: Option<&std::path::Path>,
+    output_path: &std::path::Path,
+) -> Result<()> {
+    use tokio::process::Command;
+
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-y", "-f", "concat", "-safe", "0", "-i"]).arg(list_path);
+    match audio_source {
+        Some(source) => {
+            cmd.arg("-i")
+                .arg(source)
+                .args(["-map", "0:v", "-map", "1:a?", "-c", "copy"]);
+        }
+        None => {
+            cmd.args(["-c", "copy"]);
+        }
+    }
+    let status = cmd
+        .arg(output_path)
+        .status()
+        .await
+        .context("failed to run ffmpeg concat")?;
+    if !status.success() {
+        anyhow::bail!("ffmpeg concat exited with {:?}", status.code());
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1699,4 +1749,93 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use std::process::Command;
+
+    fn run(cmd: &mut Command) {
+        let out = cmd.output().expect("spawn");
+        assert!(out.status.success(), "{:?}: {}", cmd, String::from_utf8_lossy(&out.stderr));
+    }
+
+    fn ffprobe(file: &Path, args: &[&str]) -> String {
+        let out = Command::new("ffprobe").args(["-v", "error"]).args(args).arg(file).output().expect("ffprobe");
+        assert!(out.status.success(), "ffprobe {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    /// (start_time, duration) of the file's first stream of `kind` ("v"/"a").
+    fn stream_times(file: &Path, kind: &str) -> Option<(f64, f64)> {
+        let csv = ffprobe(file, &["-select_streams", kind, "-show_entries", "stream=start_time,duration", "-of", "csv=p=0"]);
+        let line = csv.lines().next()?;
+        let mut f = line.split(',').map(|v| v.parse::<f64>().unwrap());
+        Some((f.next()?, f.next()?))
+    }
+
+    /// Audio packet durations in pts order.
+    fn audio_packet_durations(file: &Path) -> Vec<f64> {
+        let csv = ffprobe(file, &["-select_streams", "a", "-show_entries", "packet=pts_time,duration_time", "-of", "csv=p=0"]);
+        let mut packets: Vec<(f64, f64)> = csv
+            .lines()
+            .map(|l| {
+                let mut f = l.split(',').map(|v| v.parse::<f64>().unwrap());
+                (f.next().unwrap(), f.next().unwrap())
+            })
+            .collect();
+        packets.sort_by(|a, b| a.0.total_cmp(&b.0));
+        packets.into_iter().map(|(_, d)| d).collect()
+    }
+
+    // Cuts a clip the way segment_and_upload does, re-encodes each piece's
+    // video as a worker would, then joins. A cut on a keyframe leaves audio
+    // from just before the frame in the next piece, so audio joined from the
+    // pieces loses that much at each boundary; the source's audio must come
+    // through whole and start with the video.
+    #[tokio::test]
+    async fn joined_output_carries_the_source_audio_whole_and_in_sync() {
+        if Command::new("ffmpeg").arg("-version").output().is_err() {
+            eprintln!("skipping: ffmpeg is not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("join-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.mp4");
+        run(Command::new("ffmpeg").args(["-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i", "testsrc=duration=6:size=160x120:rate=25",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=6",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "25", "-c:a", "aac", "-shortest"]).arg(&source));
+        run(Command::new("ffmpeg").args(["-hide_banner", "-loglevel", "error", "-y", "-i"]).arg(&source)
+            .args(["-c", "copy", "-map", "0", "-f", "segment", "-segment_time", "2", "-reset_timestamps", "1"])
+            .arg(dir.join("seg_%03d.ts")));
+        let mut list = String::new();
+        for i in 0..3 {
+            let out = dir.join(format!("out_{}.ts", i));
+            run(Command::new("ffmpeg").args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+                .arg(dir.join(format!("seg_{:03}.ts", i)))
+                .args(["-map", "0:v", "-c:v", "libx264", "-preset", "ultrafast", "-f", "mpegts"]).arg(&out));
+            list.push_str(&format!("file '{}'\n", out.display()));
+        }
+        let list_path = dir.join("concat.txt");
+        std::fs::write(&list_path, list).unwrap();
+        let output = dir.join("output.mp4");
+
+        join_segments(&list_path, Some(&source), &output).await.unwrap();
+
+        let (v_start, v_dur) = stream_times(&output, "v").expect("video stream");
+        let (a_start, a_dur) = stream_times(&output, "a").expect("audio stream");
+        assert!(v_start.abs() < 0.001 && (v_dur - 6.0).abs() < 0.05, "video {v_start} + {v_dur}");
+        assert!(a_start.abs() <= 0.05, "audio starts at {a_start}");
+        assert!((a_dur - v_dur).abs() <= 0.1, "audio {a_dur} s vs video {v_dur} s");
+        let durations = audio_packet_durations(&output);
+        assert_eq!(durations.len(), audio_packet_durations(&source).len(), "audio packets lost");
+        let frame = 1024.0 / 44_100.0;
+        for (i, d) in durations[..durations.len() - 1].iter().enumerate() {
+            assert!((d - frame).abs() < 0.001, "audio packet {i} spans {d} s: a gap");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
