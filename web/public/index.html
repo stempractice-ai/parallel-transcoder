@@ -2090,6 +2090,7 @@ body::before {
   </div>
 </div>
 
+<script src="auth.js"></script>
 <script>
 (function() {
   'use strict';
@@ -2140,45 +2141,7 @@ body::before {
    * API
    * ================================================================== */
 
-  /* Credentials are kept client-side on a same-origin page. Admin routes take a
-   * second key so a normal operator cannot resize the billable node pool — and
-   * because that key can spend money, it lives in sessionStorage and dies with
-   * the tab, rather than sitting in localStorage on a shared machine. */
-  var Auth = {
-    KEY_ITEM: 'api.key',
-    ADMIN_ITEM: 'api.adminKey',
-    onUnauthorized: null,
-    /* Whether this deployment demands a key. Assumed true until /api/health
-     * says otherwise, so a slow probe never leaks requests unauthenticated.
-     * The desktop build reports false and has no key at all. */
-    required: true,
-    store: function(item) {
-      return item === Auth.ADMIN_ITEM ? sessionStorage : localStorage;
-    },
-    get: function(item) {
-      try { return Auth.store(item).getItem(item) || ''; } catch (e) { return ''; }
-    },
-    set: function(item, value) {
-      try { Auth.store(item).setItem(item, value || ''); } catch (e) {}
-    },
-    key: function() { return Auth.get(Auth.KEY_ITEM); },
-    adminKey: function() { return Auth.get(Auth.ADMIN_ITEM); },
-    clearKey: function() { Auth.set(Auth.KEY_ITEM, ''); },
-    needsAdmin: function(url, method) {
-      if (url.indexOf('/api/cluster/workers') === 0) return true;
-      return url === '/api/jobs' && String(method || 'GET').toUpperCase() === 'DELETE';
-    },
-    headers: function(url, opts) {
-      var h = Object.assign({}, (opts && opts.headers) || {});
-      var k = Auth.key();
-      if (k) h['X-API-Key'] = k;
-      if (Auth.needsAdmin(url, opts && opts.method)) {
-        var a = Auth.adminKey();
-        if (a) h['X-Admin-Key'] = a;
-      }
-      return h;
-    }
-  };
+  var Auth = window.Auth;
 
   var API = {
     /* Every call goes through here so no route can be left unauthenticated. */
@@ -2188,11 +2151,10 @@ body::before {
       /* Captured before the request: by the time a 401 lands, a concurrent
        * failure may already have cleared storage, and reading it back would
        * misreport a rejected key as "no key supplied". */
-      var sentKey = !!Auth.key();
+      var sentKey = Auth.key();
       return fetch(url, o).then(function(r) {
         if (r.status === 401) {
-          Auth.clearKey();
-          if (Auth.onUnauthorized) Auth.onUnauthorized(sentKey);
+          Auth.rejected(sentKey);
           throw new Error('Unauthorized — enter your API key');
         }
         return r;
@@ -2209,15 +2171,14 @@ body::before {
          * The key is captured here, before send, for the same reason as in
          * API.fetch: a concurrent 401 can clear storage before this one lands. */
         var h = Auth.headers('/api/upload', { method: 'POST' });
-        var sentKey = !!Auth.key();
+        var sentKey = Auth.key();
         Object.keys(h).forEach(function(name) { xhr.setRequestHeader(name, h[name]); });
         xhr.upload.onprogress = function(e) {
           if (e.lengthComputable && onProgress) onProgress(Math.round((e.loaded / e.total) * 100));
         };
         xhr.onload = function() {
           if (xhr.status === 401) {
-            Auth.clearKey();
-            if (Auth.onUnauthorized) Auth.onUnauthorized(sentKey);
+            Auth.rejected(sentKey);
             reject(new Error('Unauthorized — enter your API key'));
             return;
           }
@@ -2399,8 +2360,9 @@ body::before {
         /* 4401 means the key is wrong or missing — reconnecting once a second
          * would just hammer the server, so prompt instead. */
         if (ev && ev.code === 4401) {
-          Auth.clearKey();
-          if (Auth.onUnauthorized) Auth.onUnauthorized(!!connKey);
+          Auth.rejected(connKey);
+          // A stale socket's rejection leaves the current key in place; reconnect with it.
+          if (Auth.key()) WS._retry();
           return;
         }
         WS._retry();
@@ -3640,16 +3602,17 @@ body::before {
       });
 
       Auth.onUnauthorized = function(hadKey) {
-        apiInput.value = '';
-        // Only call it a rejection if a key was actually presented; on a cold
-        // load with no key at all, the honest message is the prompt.
+        // Called only for a real rejection (hadKey) or a cold load with no key at
+        // all. Blanking or refocusing on the latter would erase or interrupt a
+        // key the user is still typing while keyless polls keep failing.
         if (hadKey) {
+          apiInput.value = '';
           rejected = true;
           setHelp(REJECTED);
+          apiInput.focus();
         } else {
           setHelp(PROMPT);
         }
-        apiInput.focus();
       };
       if (!Auth.key()) setHelp(PROMPT);
     },
