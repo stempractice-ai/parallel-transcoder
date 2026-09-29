@@ -23,7 +23,7 @@ patches:
 images:
   - name: transcoder-node
     newName: iad.ocir.io/idr5qsmifndm/transcoder-node
-    newTag: "v0.1.11"
+    newTag: "v0.1.12"
   - name: transcoder-web
     newName: iad.ocir.io/idr5qsmifndm/transcoder-web
     newTag: "v0.1.17"
