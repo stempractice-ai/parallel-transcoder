@@ -1841,7 +1841,7 @@ body::before {
 
           <div class="field" id="grpEncoder">
             <label class="field-label" for="optEncoder">Encoder</label>
-            <select id="optEncoder" onchange="onEncoderChange()">
+            <select id="optEncoder">
               <optgroup label="H.264 / AVC">
                 <option value="libx264" selected>libx264 (CPU)</option>
                 <option value="h264_videotoolbox" class="enc-macos">H.264 VideoToolbox (macOS GPU)</option>
@@ -2596,6 +2596,9 @@ body::before {
 
       UI.els.optMode.addEventListener('change', function() { App.touched.mode = true; UI.syncSettings(); });
       document.getElementById('optPreset').addEventListener('change', function() { App.touched.preset = true; });
+
+      document.getElementById('optEncoder').addEventListener('change', onEncoderChange);
+      onEncoderChange();
 
       UI.els.optTolerance.addEventListener('input', function() {
         UI.els.toleranceValue.textContent = parseFloat(this.value).toFixed(2);

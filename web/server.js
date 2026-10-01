@@ -553,6 +553,26 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage, limits: { fileSize: UPLOAD_LIMIT } });
 
+// busboy reports a malformed request body as a plain Error, which multer
+// forwards unclassified, so the global handler would log it as unhandled
+// and answer 500. These are busboy 1.6.0's exact messages for bodies the
+// client got wrong; anything else (storage, I/O) still reaches that handler.
+const MALFORMED_MULTIPART = new Set([
+  "Malformed content type",
+  "Multipart: Boundary not found",
+  "Malformed part header",
+  "Unexpected end of form",
+  "Unexpected end of file",
+]);
+const uploadVideo = (req, res, next) => {
+  upload.single("video")(req, res, (err) => {
+    if (err && !(err instanceof multer.MulterError) && MALFORMED_MULTIPART.has(err.message)) {
+      return res.status(400).json({ error: `Upload error: ${err.message}` });
+    }
+    next(err);
+  });
+};
+
 // ---------------------------------------------------------------------------
 // Routes
 // ---------------------------------------------------------------------------
@@ -623,7 +643,7 @@ app.get("/api/capabilities", (_req, res) => {
 });
 
 // Upload video
-app.post("/api/upload", upload.single("video"), (req, res) => {
+app.post("/api/upload", uploadVideo, (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: "No file uploaded" });
   }
