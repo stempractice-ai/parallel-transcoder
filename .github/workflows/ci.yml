@@ -49,6 +49,13 @@ jobs:
       # electron/electron-builder (devDependencies, tracked separately as
       # SUP-D1) carry high and critical ones that this gate does not own.
       - run: npm audit --omit=dev --audit-level=high
+      # npm audit matches advisory ranges with semver, which never counts a
+      # prerelease-tagged version (multer 1.4.5-lts.2) as inside "<2.0.0", so
+      # such packages pass it unchecked. GitHub's advisory database matches
+      # them; this looks every prerelease-tagged production package up there.
+      - run: node tools/audit-prerelease.js
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
 
   rust:
     name: cluster crate
