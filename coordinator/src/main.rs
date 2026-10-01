@@ -1164,6 +1164,8 @@ async fn run_cluster_mode(
             format: args.format.clone(),
             fast_mode: args.fast,
             hw_decode: false,
+            mode: mode_from_args(args).to_string(),
+            smart_tolerance: args.smart_tolerance,
         },
         srt_input_url: None,
     };

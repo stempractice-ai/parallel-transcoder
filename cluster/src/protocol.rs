@@ -163,6 +163,20 @@ pub struct EncodingConfig {
     pub format: String,
     pub fast_mode: bool,
     pub hw_decode: bool,
+    /// "normal", "copy", "smart" or "smart-auto"; older senders omit it.
+    #[serde(default = "default_mode")]
+    pub mode: String,
+    /// Bitrate tolerance for the smart modes.
+    #[serde(default = "default_smart_tolerance")]
+    pub smart_tolerance: f64,
+}
+
+fn default_mode() -> String {
+    "normal".into()
+}
+
+fn default_smart_tolerance() -> f64 {
+    0.3
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,6 +217,9 @@ pub struct SegmentDescriptor {
     pub lookahead_frames: Option<usize>,
     pub complexity_estimate: f32,
     pub scene_changes: Vec<u64>,
+    /// Stream-copy this segment's video instead of re-encoding it.
+    #[serde(default)]
+    pub copy: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -399,6 +416,7 @@ mod tests {
                 lookahead_frames: Some(30),
                 complexity_estimate: 0.75,
                 scene_changes: vec![1200, 1800],
+                copy: false,
             },
             srt_url: "srt://192.168.1.1:9100?mode=caller".into(),
             encoding_config: EncodingConfig {
@@ -408,6 +426,8 @@ mod tests {
                 format: "hls".into(),
                 fast_mode: false,
                 hw_decode: true,
+                mode: "normal".into(),
+                smart_tolerance: 0.3,
             },
         };
         let msg = Message::new(OpCode::SegmentAssign, &assign).unwrap();

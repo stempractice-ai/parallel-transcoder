@@ -33,6 +33,7 @@ use transcoder_cluster::election::ElectionManager;
 use transcoder_cluster::node::NodeManager;
 use transcoder_cluster::object_store::{is_s3_uri, ObjectStore};
 use transcoder_cluster::protocol::*;
+use transcoder_cluster::media;
 use transcoder_cluster::scheduler::Scheduler;
 use transcoder_cluster::srt::{SrtMode, SrtServer};
 use transcoder_cluster::transport::{PeerMessage, Transport};
@@ -465,7 +466,7 @@ impl App {
         // with NoSuchKey once a worker tries to fetch it.
         let segments = match (&self.object_store, &data.srt_input_url) {
             (Some(store), Some(uri)) if is_s3_uri(uri) => {
-                match segment_and_upload(store, data.job_id, uri).await {
+                match segment_and_upload(store, data.job_id, uri, &data.config).await {
                     Ok(segments) => segments,
                     Err(e) => {
                         warn!(job_id = %data.job_id, error = ?e, "Failed to segment source video");
@@ -1225,6 +1226,7 @@ fn analyze_video(data: &JobSubmitData) -> Vec<SegmentDescriptor> {
             lookahead_frames: Some(30),
             complexity_estimate: 0.5,
             scene_changes: vec![],
+            copy: false,
         })
         .collect()
 }
@@ -1245,6 +1247,7 @@ async fn segment_and_upload(
     store: &ObjectStore,
     job_id: JobId,
     source_uri: &str,
+    config: &EncodingConfig,
 ) -> Result<Vec<SegmentDescriptor>> {
     use tokio::process::Command;
 
@@ -1354,6 +1357,7 @@ async fn segment_and_upload(
             lookahead_frames: Some(30),
             complexity_estimate: 0.5,
             scene_changes: vec![],
+            copy: false,
         });
     }
 
@@ -1363,6 +1367,41 @@ async fn segment_and_upload(
         segment_count = descriptors.len(),
         "Segmented and uploaded source video"
     );
+
+    match config.mode.as_str() {
+        "copy" => descriptors.iter_mut().for_each(|d| d.copy = true),
+        "smart" | "smart-auto" => {
+            let path = source_path.to_string_lossy().into_owned();
+            match tokio::task::spawn_blocking(move || media::fast_analyze_video(&path)).await {
+                Ok(Ok(meta)) => {
+                    // The cuts are nominal 0-based times; the probe's GOPs
+                    // carry the source's own start offset.
+                    let t0 = meta.gop_stats.first().map(|g| g.start_time).unwrap_or(0.0);
+                    let ranges: Vec<(f64, f64)> = descriptors
+                        .iter()
+                        .map(|d| (d.start_timestamp + t0, d.end_timestamp + t0))
+                        .collect();
+                    let plan = media::plan_segments(
+                        &meta,
+                        &ranges,
+                        &config.mode,
+                        &config.encoder,
+                        config.crf,
+                        config.smart_tolerance,
+                    );
+                    for (d, copy) in descriptors.iter_mut().zip(plan.copy) {
+                        d.copy = copy;
+                    }
+                }
+                Ok(Err(e)) => warn!(%job_id, error = ?e, "Smart analysis failed; encoding every segment"),
+                Err(e) => warn!(%job_id, error = ?e, "Smart analysis failed; encoding every segment"),
+            }
+        }
+        _ => {}
+    }
+    let n_copy = descriptors.iter().filter(|d| d.copy).count();
+    let n_encode = descriptors.len() - n_copy;
+    info!(%job_id, mode = %config.mode, copy = n_copy, encode = n_encode, "Segment modes");
 
     // Best-effort cleanup — an emptyDir scratch volume, not worth failing
     // the job over if this doesn't succeed.
@@ -1453,7 +1492,11 @@ async fn spawn_worker(
         .arg("0")
         .arg("--segment")
         .arg(&segment_json)
-        .arg("--presplit")
+        .arg("--presplit");
+    if data.segment.copy {
+        cmd.arg("--copy");
+    }
+    cmd
         .arg("--crf")
         .arg(data.encoding_config.crf.to_string())
         .arg("--preset")
