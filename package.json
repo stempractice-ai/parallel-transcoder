@@ -36,8 +36,8 @@
     "ws": "^8.18.0"
   },
   "devDependencies": {
-    "electron": "^33.0.0",
-    "electron-builder": "^25.0.0",
+    "electron": "^41.10.6",
+    "electron-builder": "^26.15.3",
     "js-yaml": "4.3.2"
   },
   "engines": {
