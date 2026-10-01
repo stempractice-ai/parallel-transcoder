@@ -40,6 +40,8 @@ pub enum OpCode {
     JobComplete = 33,
     JobFailed = 34,
     JobCancel = 35,
+    AnalyzeRequest = 36,
+    AnalyzeResult = 37,
 
     // Segment distribution
     SegmentAssign = 40,
@@ -202,6 +204,25 @@ pub struct JobProgressData {
     pub total_segments: usize,
     pub failed_segments: usize,
     pub phase: String,
+}
+
+// --- Analysis payloads ---
+
+/// Asks the master to probe a source and recommend a mode and preset.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalyzeRequestData {
+    pub request_id: Uuid,
+    pub source_url: String,
+    pub encoder: String,
+    pub crf: u32,
+    pub smart_tolerance: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalyzeResultData {
+    pub request_id: Uuid,
+    pub media: crate::media::MediaSummary,
+    pub recommendation: crate::media::Recommendation,
 }
 
 // --- Segment payloads ---
@@ -475,6 +496,24 @@ mod tests {
         // Deserialize from numeric form (what the JS web server sends).
         let m: Message = serde_json::from_str(r#"{"op":50,"d":{}}"#).unwrap();
         assert_eq!(m.op, OpCode::StatusRequest);
+
+        assert_eq!(serde_json::to_string(&OpCode::AnalyzeRequest).unwrap(), "36");
+        assert_eq!(serde_json::to_string(&OpCode::AnalyzeResult).unwrap(), "37");
+    }
+
+    #[test]
+    fn test_encoding_config_defaults_mode_when_absent() {
+        let json = r#"{"crf":23,"preset":"medium","encoder":"libx264","format":"mp4","fast_mode":false,"hw_decode":false}"#;
+        let c: EncodingConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(c.mode, "normal");
+        assert_eq!(c.smart_tolerance, 0.3);
+    }
+
+    #[test]
+    fn test_segment_descriptor_defaults_copy_false() {
+        let json = r#"{"id":0,"start_frame":0,"end_frame":60,"start_timestamp":0.0,"end_timestamp":2.0,"complexity_estimate":0.5,"scene_changes":[]}"#;
+        let s: SegmentDescriptor = serde_json::from_str(json).unwrap();
+        assert!(!s.copy);
     }
 
     #[test]

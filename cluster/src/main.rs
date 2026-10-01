@@ -150,6 +150,8 @@ struct App {
     pending_results: HashMap<usize, (mpsc::UnboundedReceiver<ResultMessage>, SocketAddr)>,
     /// Final-output assembly tasks in flight (job_id -> result channel).
     pending_assembly: HashMap<JobId, mpsc::UnboundedReceiver<AssemblyResult>>,
+    /// Source analyses in flight (request_id -> requesting peer, result channel).
+    pending_analysis: HashMap<Uuid, (SocketAddr, mpsc::UnboundedReceiver<Result<AnalyzeResultData, String>>)>,
     /// CLI configuration.
     worker_binary: PathBuf,
     lib_dir: PathBuf,
@@ -182,6 +184,7 @@ impl App {
             local_workers: HashMap::new(),
             pending_results: HashMap::new(),
             pending_assembly: HashMap::new(),
+            pending_analysis: HashMap::new(),
             worker_binary,
             lib_dir,
             object_store,
@@ -238,6 +241,7 @@ impl App {
 
             // -- Jobs --
             OpCode::JobSubmit => self.handle_job_submit(peer_addr, &message).await,
+            OpCode::AnalyzeRequest => self.handle_analyze_request(peer_addr, &message),
 
             // -- Segments --
             OpCode::SegmentAssign => self.handle_segment_assign(peer_addr, &message).await,
@@ -430,6 +434,36 @@ impl App {
     // ====================================================================
     // Job management (master only)
     // ====================================================================
+
+    /// Starts a source analysis and returns at once; poll_analysis_results
+    /// replies when it finishes, so the event loop never waits on a download.
+    fn handle_analyze_request(&mut self, peer_addr: SocketAddr, msg: &Message) {
+        let reply_error = |transport: &Transport, code: u32, message: String| {
+            if let Ok(resp) = Message::new(OpCode::Error, &ErrorData { code, message }) {
+                let _ = transport.send_to(&peer_addr, resp);
+            }
+        };
+        if !self.is_master() {
+            warn!("Received AnalyzeRequest but not master — rejecting");
+            reply_error(&self.transport, 403, "Not the master node".into());
+            return;
+        }
+        let Ok(data) = msg.parse_data::<AnalyzeRequestData>() else {
+            warn!("Failed to parse AnalyzeRequest payload");
+            return;
+        };
+        let Some(store) = self.object_store.clone().filter(|_| is_s3_uri(&data.source_url)) else {
+            reply_error(&self.transport, 400, "Analysis needs an s3:// source and an object store".into());
+            return;
+        };
+
+        info!(request_id = %data.request_id, uri = %data.source_url, "Analysing source");
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.pending_analysis.insert(data.request_id, (peer_addr, rx));
+        tokio::spawn(async move {
+            let _ = tx.send(analyze_source(store, data).await.map_err(|e| format!("{e:#}")));
+        });
+    }
 
     async fn handle_job_submit(&mut self, peer_addr: SocketAddr, msg: &Message) {
         if !self.is_master() {
@@ -920,6 +954,38 @@ impl App {
         }
     }
 
+    /// Reply to each finished source analysis, and drop it.
+    fn poll_analysis_results(&mut self) {
+        let mut done = Vec::new();
+
+        for (&request_id, (peer, rx)) in &mut self.pending_analysis {
+            match rx.try_recv() {
+                Ok(result) => {
+                    let msg = match result {
+                        Ok(r) => Message::new(OpCode::AnalyzeResult, &r),
+                        Err(e) => {
+                            warn!(%request_id, error = %e, "Source analysis failed");
+                            Message::new(OpCode::Error, &ErrorData {
+                                code: 500,
+                                message: format!("Analysis failed: {e}"),
+                            })
+                        }
+                    };
+                    if let Ok(msg) = msg {
+                        let _ = self.transport.send_to(peer, msg);
+                    }
+                    done.push(request_id);
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {}
+                Err(mpsc::error::TryRecvError::Disconnected) => done.push(request_id),
+            }
+        }
+
+        for request_id in done {
+            self.pending_analysis.remove(&request_id);
+        }
+    }
+
     // ====================================================================
     // Status
     // ====================================================================
@@ -1057,6 +1123,41 @@ struct AssemblyResult {
     outcome: Result<String>,
 }
 
+/// "source" plus the extension of the object `uri` names, so ffmpeg can
+/// pick the demuxer from the local file name.
+fn source_file_name(uri: &str) -> String {
+    let ext = std::path::Path::new(uri.rsplit('/').next().unwrap_or_default())
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    format!("source{}", ext)
+}
+
+/// Downloads `req.source_url`, probes it and recommends a mode and preset.
+/// The work dir is removed whether or not the analysis succeeds.
+async fn analyze_source(store: ObjectStore, req: AnalyzeRequestData) -> Result<AnalyzeResultData> {
+    let work_dir = std::env::temp_dir().join(format!("transcoder-analyze-{}", req.request_id));
+    let result = async {
+        tokio::fs::create_dir_all(&work_dir).await?;
+        let path = work_dir.join(source_file_name(&req.source_url));
+        ObjectStore::download_to_file(&req.source_url, &store, &path)
+            .await
+            .context("failed to download source for analysis")?;
+        let path = path.to_string_lossy().into_owned();
+        let meta = tokio::task::spawn_blocking(move || media::fast_analyze_video(&path))
+            .await
+            .context("analysis task failed")??;
+        Ok(AnalyzeResultData {
+            request_id: req.request_id,
+            media: media::MediaSummary::from(&meta),
+            recommendation: media::recommend(&meta, &req.encoder, req.crf, req.smart_tolerance),
+        })
+    }
+    .await;
+    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+    result
+}
+
 /// Download every segment's encoded output, concatenate them via ffmpeg's
 /// concat demuxer (stream copy — segments share the same codec/settings
 /// since one job encodes all of them with the same config), and upload the
@@ -1089,11 +1190,7 @@ async fn assemble_output(
 
     let source_path = match source_uri {
         Some(uri) => {
-            let ext = std::path::Path::new(uri.rsplit('/').next().unwrap_or_default())
-                .extension()
-                .map(|e| format!(".{}", e.to_string_lossy()))
-                .unwrap_or_default();
-            let path = work_dir.join(format!("source{}", ext));
+            let path = work_dir.join(source_file_name(uri));
             ObjectStore::download_to_file(uri, store, &path)
                 .await
                 .with_context(|| format!("failed to download source for its audio {}", uri))?;
@@ -1814,6 +1911,7 @@ async fn main() -> Result<()> {
                 app.run_scheduler();
                 app.poll_worker_results();
                 app.poll_assembly_results();
+                app.poll_analysis_results();
             }
 
             // Graceful shutdown on Ctrl+C.
