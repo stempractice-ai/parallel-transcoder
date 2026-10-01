@@ -289,8 +289,8 @@ async function scaleWorkers(replicas) {
 }
 
 /** Upload the local source file to the object store; returns an s3:// URI. */
-async function uploadSourceToObjectStore(jobId, inputPath) {
-  const key = `jobs/${jobId}/source/${path.basename(inputPath)}`;
+async function uploadSourceToObjectStore(inputPath) {
+  const key = `sources/${path.basename(inputPath)}`;
   // Streamed with an explicit ContentLength: buffering the source put the
   // whole file in RSS, and anything past ~150 MB OOM-killed the 256Mi pod,
   // taking every in-memory job record with it.
@@ -302,6 +302,20 @@ async function uploadSourceToObjectStore(jobId, inputPath) {
     ContentLength: size,
   }));
   return `s3://${OBJECT_STORE_BUCKET}/${key}`;
+}
+
+const clusterSources = new Map(); // uploadId -> Promise<s3 URI>
+
+/** The uploaded file's object-store URI, uploading it the first time only:
+ *  analysis and the transcode that follows use the same copy. */
+function sourceInObjectStore(uploadId, inputPath) {
+  let p = clusterSources.get(uploadId);
+  if (!p) {
+    p = uploadSourceToObjectStore(inputPath);
+    clusterSources.set(uploadId, p);
+    p.catch(() => clusterSources.delete(uploadId));
+  }
+  return p;
 }
 
 /** Stream an s3://bucket/key object to a local path. The body is never held
@@ -873,6 +887,7 @@ app.delete("/api/jobs", requireAdmin, async (_req, res) => {
     if (job.config && job.config.uploadId) {
       const srcPath = path.join(UPLOAD_DIR, path.basename(job.config.uploadId));
       fsp.rm(srcPath, { force: true }).catch(() => {});
+      clusterSources.delete(job.config.uploadId);
     }
     subscribers.delete(job.id);
     count++;
@@ -1019,6 +1034,8 @@ app.post("/api/cluster/transcode", async (req, res) => {
     crf = 23,
     preset = "medium",
     encoder = "libx264",
+    mode = "normal",
+    smartTolerance = 0.3,
   } = req.body;
 
   const inputPath = path.join(UPLOAD_DIR, path.basename(uploadId));
@@ -1033,7 +1050,7 @@ app.post("/api/cluster/transcode", async (req, res) => {
     id: jobId,
     status: "running",
     process: null,
-    config: { uploadId, format, crf, preset, encoder, cluster: true },
+    config: { uploadId, format, crf, preset, encoder, mode, cluster: true },
     outputDir: null,
     logs: [],
     phase: "starting",
@@ -1049,7 +1066,7 @@ app.post("/api/cluster/transcode", async (req, res) => {
   try {
     let srtInputUrl = null;
     if (s3Client) {
-      srtInputUrl = await uploadSourceToObjectStore(jobId, inputPath);
+      srtInputUrl = await sourceInObjectStore(uploadId, inputPath);
     }
 
     const result = await submitClusterJob(master, {
@@ -1059,6 +1076,8 @@ app.post("/api/cluster/transcode", async (req, res) => {
       crf,
       preset,
       encoder,
+      mode,
+      smartTolerance,
       srtInputUrl,
     });
     res.json({ jobId, master, status: "submitted", clusterId: result.jobId });
@@ -1071,6 +1090,36 @@ app.post("/api/cluster/transcode", async (req, res) => {
     job.errorMessage = "Cluster submission failed";
     broadcast(jobId, { type: "error", jobId, message: job.errorMessage });
     res.status(500).json({ error: "Cluster submission failed" });
+  }
+});
+
+// Analyse an uploaded source on the cluster master and return its
+// recommendation. The source copy is reused by the transcode that follows.
+app.post("/api/cluster/analyze", async (req, res) => {
+  let master;
+  try { master = resolveMaster(req); }
+  catch (err) { return res.status(err.statusCode || 400).json({ error: err.message }); }
+
+  const invalid = validateTranscodeParams(req.body, { cluster: true });
+  if (invalid) return res.status(400).json(invalid);
+
+  if (!s3Client) {
+    return res.status(501).json({ error: "Cluster analysis needs an object store" });
+  }
+
+  const { uploadId, crf = 23, encoder = "libx264", smartTolerance = 0.3 } = req.body;
+  const inputPath = path.join(UPLOAD_DIR, path.basename(uploadId));
+  if (!fs.existsSync(inputPath)) {
+    return res.status(404).json({ error: "Uploaded file not found" });
+  }
+
+  try {
+    const sourceUri = await sourceInObjectStore(uploadId, inputPath);
+    const d = await analyzeOnCluster(master, { sourceUri, encoder, crf, smartTolerance });
+    res.json({ media: d.media, recommendation: d.recommendation, source: "cluster" });
+  } catch (err) {
+    console.error("[cluster] analysis failed:", err.message);
+    res.status(502).json({ error: "Cluster analysis failed" });
   }
 });
 
@@ -1399,8 +1448,53 @@ function queryCluster(master, timeout = 5000) {
   });
 }
 
+/** Ask the cluster master to analyse an object-store source (AnalyzeRequest,
+ *  op 36) and resolve with its AnalyzeResult (op 37) payload. */
+function analyzeOnCluster(master, { sourceUri, encoder, crf, smartTolerance }, timeoutMs = 300000) {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(`ws://${master}`);
+    const requestId = crypto.randomUUID();
+    let settled = false;
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      ws.close();
+      fn(value);
+    };
+
+    const timer = setTimeout(() => finish(reject, new Error("Cluster analysis timed out")), timeoutMs);
+
+    ws.on("open", () => {
+      ws.send(JSON.stringify({
+        op: 36,
+        d: {
+          request_id: requestId,
+          source_url: sourceUri,
+          encoder,
+          crf: Number(crf),
+          smart_tolerance: Number(smartTolerance),
+        },
+      }));
+    });
+
+    ws.on("message", (data) => {
+      let msg;
+      try { msg = JSON.parse(data.toString()); } catch { return; }
+      if (msg.op === 37 && msg.d && msg.d.request_id === requestId) {
+        finish(resolve, msg.d);
+      } else if (msg.op === 255) {
+        finish(reject, new Error((msg.d && msg.d.message) || "Cluster error"));
+      }
+    });
+
+    ws.on("error", (err) => finish(reject, err));
+    ws.on("close", () => finish(reject, new Error("Cluster connection closed")));
+  });
+}
+
 /** Submit a transcode job to the cluster master. */
-function submitClusterJob(master, { jobId, inputPath, format, crf, preset, encoder, srtInputUrl }) {
+function submitClusterJob(master, { jobId, inputPath, format, crf, preset, encoder, mode, smartTolerance, srtInputUrl }) {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(`ws://${master}`);
 
@@ -1426,6 +1520,8 @@ function submitClusterJob(master, { jobId, inputPath, format, crf, preset, encod
             preset,
             encoder,
             format,
+            mode,
+            smart_tolerance: Number(smartTolerance),
             fast_mode: true,
             hw_decode: false,
           },
