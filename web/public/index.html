@@ -562,6 +562,8 @@ body::before {
   gap: 5px;
 }
 
+.auto-note{color:var(--text-muted);font-size:0.75rem}
+
 .field-label {
   font-family: var(--font-mono);
   font-size: 10px;
@@ -1835,6 +1837,7 @@ body::before {
               <option value="smart-auto">Smart Auto</option>
             </select>
           </div>
+          <div class="field full-width"><small id="autoNote" class="auto-note" aria-live="polite"></small></div>
 
           <div class="field" id="grpEncoder">
             <label class="field-label" for="optEncoder">Encoder</label>
@@ -2205,6 +2208,20 @@ body::before {
       });
     },
 
+    clusterAnalyze: function(master, params) {
+      /* Validated like a cluster transcode, which accepts MP4 only. */
+      var body = Object.assign({}, params, { format: 'mp4' }, master ? { master: master } : {});
+      return API.fetch('/api/cluster/analyze', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      }).then(function(r) {
+        if (r.status === 501) return null;
+        if (!r.ok) throw new Error('Cluster analysis failed: ' + r.status);
+        return r.json();
+      });
+    },
+
     transcode: function(params) {
       return API.fetch('/api/transcode', {
         method: 'POST',
@@ -2480,7 +2497,7 @@ body::before {
   /** Hide the local-only controls when the deployment ships no coordinator. */
   function applyLocalModeAvailability(localMode) {
     if (localMode !== false) return;
-    var hide = ['btnAnalyze', 'optWorkers'];
+    var hide = ['optWorkers'];
     hide.forEach(function(id) {
       var el = document.getElementById(id);
       if (!el) return;
@@ -2577,7 +2594,8 @@ body::before {
         if (this.files.length > 0) App.handleFile(this.files[0]);
       });
 
-      UI.els.optMode.addEventListener('change', function() { UI.syncSettings(); });
+      UI.els.optMode.addEventListener('change', function() { App.touched.mode = true; UI.syncSettings(); });
+      document.getElementById('optPreset').addEventListener('change', function() { App.touched.preset = true; });
 
       UI.els.optTolerance.addEventListener('input', function() {
         UI.els.toleranceValue.textContent = parseFloat(this.value).toFixed(2);
@@ -2588,7 +2606,7 @@ body::before {
         if (e.key === 'Enter') App.importUrl();
       });
 
-      UI.els.btnAnalyze.addEventListener('click', function() { App.analyze(); });
+      UI.els.btnAnalyze.addEventListener('click', function() { App.analyze(false); });
       UI.els.btnTranscode.addEventListener('click', function() { App.transcode(); });
       UI.els.btnClearJobs.addEventListener('click', function() { App.clearAllJobs(); });
 
@@ -2641,6 +2659,26 @@ body::before {
       UI.els.emptyState.style.display = has ? 'none' : 'flex';
     },
 
+    /* ─── Auto-selection ─── */
+
+    applyRecommendation: function(rec) {
+      var fields = [
+        { key: 'mode', el: UI.els.optMode, value: rec.mode },
+        { key: 'preset', el: document.getElementById('optPreset'), value: rec.preset }
+      ];
+      var kept = [];
+      fields.forEach(function(f) {
+        if (App.touched[f.key]) { kept.push(f.key); return; }
+        var exists = Array.prototype.some.call(f.el.options, function(o) { return o.value === f.value; });
+        if (exists) f.el.value = f.value;
+      });
+      UI.syncSettings();
+      var note = 'Auto-selected from analysis: mode ' + rec.mode + ', preset ' + rec.preset + '.';
+      if (kept.length) note += ' Kept your ' + kept.join(' and ') + '.';
+      if (rec.reasons && rec.reasons.length) note += ' ' + rec.reasons.join(' ');
+      document.getElementById('autoNote').textContent = note;
+    },
+
     /* ─── Analysis ─── */
 
     renderAnalysis: function(data) {
@@ -2655,6 +2693,24 @@ body::before {
         h += '</div>';
       }
       h += '</div><div class="analysis-body">';
+
+      if (data.media) {
+        var m = data.media;
+        var dash = function(v) { return (v === null || v === undefined || v === '') ? '--' : String(v); };
+        var dims = (m.width && m.height) ? (m.width + '\u00d7' + m.height) : '--';
+        var fps = (typeof m.fps === 'number') ? (Math.round(m.fps * 100) / 100) + ' fps' : '-- fps';
+        var dur = (typeof m.duration_secs === 'number') ? formatTime(m.duration_secs) : '--';
+        var codec = dash(m.codec) + (m.profile ? ' (' + m.profile + ')' : '');
+        var rate = (typeof m.avg_bitrate_bps === 'number') ? (m.avg_bitrate_bps / 1e6).toFixed(2) + ' Mbps' : '-- Mbps';
+        h += '<div class="analysis-media">' + esc([dims, fps, dur, codec, rate].join(' \u00b7 ')) + '</div>';
+        if (data.recommendation) {
+          var rec = data.recommendation;
+          h += '<div class="analysis-recommendation">Recommended: ' + esc(dash(rec.mode)) + ', preset ' + esc(dash(rec.preset)) + '</div>';
+          if (rec.reasons && rec.reasons.length) {
+            h += '<ul class="analysis-reasons">' + rec.reasons.map(function(r) { return '<li>' + esc(r) + '</li>'; }).join('') + '</ul>';
+          }
+        }
+      }
 
       if (data.summary && data.summary.global_blockers && data.summary.global_blockers.length > 0) {
         h += '<div class="global-blockers">';
@@ -3547,6 +3603,8 @@ body::before {
   var App = {
     uploadId: null,
     jobs: new Map(),
+    touched: { mode: false, preset: false },
+    localMode: true,
 
     init: function() {
       App.initAuth();
@@ -3563,6 +3621,7 @@ body::before {
       API.health()
         .then(function(h) {
           if (h && h.authRequired === false) Auth.required = false;
+          App.localMode = !(h && h.localMode === false);
           applyLocalModeAvailability(h && h.localMode);
           App.applyAuthRequirement();
         })
@@ -3692,6 +3751,8 @@ body::before {
         UI.els.btnTranscode.disabled = false;
         UI.els.urlImportBtn.disabled = false;
         UI.els.urlImportBtn.textContent = 'Import';
+        App.touched = { mode: false, preset: false };
+        App.analyze(true);
       }).catch(function(err) {
         UI.els.uploadProgressText.textContent = 'Import failed';
         UI.els.uploadProgressFill.style.width = '0%';
@@ -3729,6 +3790,8 @@ body::before {
         UI.els.uploadProgressText.textContent = 'Upload complete';
         UI.els.btnAnalyze.disabled = false;
         UI.els.btnTranscode.disabled = false;
+        App.touched = { mode: false, preset: false };
+        App.analyze(true);
       }).catch(function(err) {
         UI.els.uploadProgressText.textContent = 'Upload failed';
         UI.els.uploadProgressFill.style.width = '0%';
@@ -3737,14 +3800,39 @@ body::before {
       });
     },
 
-    analyze: function() {
+    /** Analyse the current upload and apply its recommendation. `auto` is
+     *  the post-upload run: its failures only update the note. */
+    analyze: function(auto) {
       if (!App.uploadId) return;
+      var s = UI.getSettings();
+      var note = document.getElementById('autoNote');
+      var run;
+      if (Cluster.useCluster && Cluster.master) {
+        run = API.clusterAnalyze(Cluster.master, s).then(function(data) {
+          if (data === null && App.localMode) return API.analyze(s);
+          return data;
+        });
+      } else if (App.localMode) {
+        run = API.analyze(s);
+      } else {
+        run = Promise.resolve(null);
+      }
+      note.textContent = 'Analyzing source\u2026';
       UI.setBtnLoading(UI.els.btnAnalyze, true);
-      API.analyze(UI.getSettings()).then(function(data) {
+      run.then(function(data) {
         UI.setBtnLoading(UI.els.btnAnalyze, false);
+        if (data === null) {
+          note.textContent = 'Automatic analysis is not available here; using the current settings.';
+          return;
+        }
         UI.renderAnalysis(data);
+        if (data.recommendation) UI.applyRecommendation(data.recommendation);
       }).catch(function(err) {
         UI.setBtnLoading(UI.els.btnAnalyze, false);
+        if (auto) {
+          note.textContent = 'Automatic analysis failed; using the current settings.';
+          return;
+        }
         console.error('Analyze error:', err);
         alert('Analysis failed: ' + err.message);
       });
