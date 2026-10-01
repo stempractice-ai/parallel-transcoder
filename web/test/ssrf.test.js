@@ -30,13 +30,13 @@ test("isBlockedAddress covers every private, loopback and link-local range", () 
     ["fc00::1", 6], ["fd12:3456::1", 6],
     ["fe80::1", 6],
   ];
-  for (const [addr, family] of blocked) {
+  for (const [addr] of blocked) {
     assert.equal(isBlockedAddress(addr), true, `${addr} should be blocked`);
   }
 });
 
 test("isBlockedAddress permits ordinary public addresses", () => {
-  for (const [addr, family] of [["93.184.216.34", 4], ["8.8.8.8", 4], ["172.32.0.1", 4], ["2606:2800:220:1::1", 6]]) {
+  for (const [addr] of [["93.184.216.34", 4], ["8.8.8.8", 4], ["172.32.0.1", 4], ["2606:2800:220:1::1", 6]]) {
     assert.equal(isBlockedAddress(addr), false, `${addr} should be allowed`);
   }
 });

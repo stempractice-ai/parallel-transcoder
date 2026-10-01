@@ -32,13 +32,36 @@ test("a malformed multipart upload is rejected and the server stays up", async (
       headers: { "X-API-Key": KEY, "Content-Type": `multipart/form-data; boundary=${BOUNDARY}` },
       body,
     });
-    assert.ok(r.status >= 400 && r.status < 600, `expected an error response, got ${r.status}`);
+    assert.equal(r.status, 400, JSON.stringify(r.json));
+    assert.deepEqual(r.json, { error: "Upload error: Malformed part header" });
 
     // Give a late busboy error time to surface before checking liveness.
     await new Promise((resolve) => setTimeout(resolve, 500));
     assert.equal(s.child.exitCode, null, `server exited:\n${s.stderr()}`);
     const health = await req(s.url, "/api/health");
     assert.equal(health.status, 200);
+  } finally {
+    await s.stop();
+  }
+});
+
+test("a multipart upload cut off before its closing boundary gets 400", async () => {
+  const s = await startServer({ env: { TRANSCODER_API_KEY: KEY } });
+  try {
+    const body = [
+      `--${BOUNDARY}`,
+      'Content-Disposition: form-data; name="video"; filename="a.mp4"',
+      "Content-Type: video/mp4",
+      "",
+      "partial bytes",
+    ].join("\r\n");
+    const r = await req(s.url, "/api/upload", {
+      method: "POST",
+      headers: { "X-API-Key": KEY, "Content-Type": `multipart/form-data; boundary=${BOUNDARY}` },
+      body,
+    });
+    assert.equal(r.status, 400, JSON.stringify(r.json));
+    assert.match(r.json.error, /^Upload error: Unexpected end of (form|file)$/);
   } finally {
     await s.stop();
   }
