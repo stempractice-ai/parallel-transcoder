@@ -31,23 +31,23 @@ test("isBlockedAddress covers every private, loopback and link-local range", () 
     ["fe80::1", 6],
   ];
   for (const [addr, family] of blocked) {
-    assert.equal(isBlockedAddress(addr, family), true, `${addr} should be blocked`);
+    assert.equal(isBlockedAddress(addr), true, `${addr} should be blocked`);
   }
 });
 
 test("isBlockedAddress permits ordinary public addresses", () => {
   for (const [addr, family] of [["93.184.216.34", 4], ["8.8.8.8", 4], ["172.32.0.1", 4], ["2606:2800:220:1::1", 6]]) {
-    assert.equal(isBlockedAddress(addr, family), false, `${addr} should be allowed`);
+    assert.equal(isBlockedAddress(addr), false, `${addr} should be allowed`);
   }
 });
 
 test("IPv4-mapped IPv6 addresses are unwrapped before the check", () => {
   // ::ffff:127.0.0.1 reaches loopback but will not match an IPv4 subnet unless
   // it is normalised first — this is the bypass the normalisation closes.
-  assert.equal(isBlockedAddress("::ffff:127.0.0.1", 6), true);
-  assert.equal(isBlockedAddress("::ffff:169.254.169.254", 6), true);
-  assert.equal(isBlockedAddress("::ffff:10.0.0.1", 6), true);
-  assert.equal(isBlockedAddress("::ffff:93.184.216.34", 6), false);
+  assert.equal(isBlockedAddress("::ffff:127.0.0.1"), true);
+  assert.equal(isBlockedAddress("::ffff:169.254.169.254"), true);
+  assert.equal(isBlockedAddress("::ffff:10.0.0.1"), true);
+  assert.equal(isBlockedAddress("::ffff:93.184.216.34"), false);
 });
 
 test("assertPublicUrl rejects each blocked target by hostname resolution", async () => {
