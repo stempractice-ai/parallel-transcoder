@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::analyzer::VideoMetadata;
+use transcoder_cluster::media::VideoMetadata;
 
 /// Represents a video segment for parallel processing
 #[derive(Debug, Clone, Serialize, Deserialize)]
