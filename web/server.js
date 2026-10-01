@@ -7,6 +7,7 @@ import crypto from "crypto";
 import path from "path";
 import fs from "fs";
 import fsp from "fs/promises";
+import { pipeline } from "stream/promises";
 import { fileURLToPath } from "url";
 import http from "http";
 import https from "https";
@@ -303,14 +304,23 @@ async function uploadSourceToObjectStore(jobId, inputPath) {
   return `s3://${OBJECT_STORE_BUCKET}/${key}`;
 }
 
-/** Download an s3://bucket/key object to a local path. */
+/** Stream an s3://bucket/key object to a local path. The body is never held
+ * in memory: the web pod is limited to 256Mi, and a buffered read of a large
+ * output OOM-killed it. It lands under a temporary name and is renamed only
+ * once complete, so a failed transfer leaves nothing that looks finished. */
 async function downloadFromObjectStore(uri, destPath) {
   const match = uri.match(/^s3:\/\/([^/]+)\/(.+)$/);
   if (!match) throw new Error(`Not an s3:// URI: ${uri}`);
   const [, bucket, key] = match;
   const resp = await s3Client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
-  const bytes = await resp.Body.transformToByteArray();
-  await fsp.writeFile(destPath, bytes);
+  const partPath = `${destPath}.part`;
+  try {
+    await pipeline(resp.Body, fs.createWriteStream(partPath));
+    await fsp.rename(partPath, destPath);
+  } catch (err) {
+    await fsp.rm(partPath, { force: true });
+    throw err;
+  }
 }
 
 /**

@@ -1115,13 +1115,47 @@ async fn assemble_output(
     Ok(store.build_uri(&out_key))
 }
 
+/// How far `source`'s first audio stream starts before its first video
+/// stream, in seconds. 0 when audio starts with or after the video, or
+/// when either stream is missing or has no start time.
+async fn audio_lead_secs(source: &std::path::Path) -> Result<f64> {
+    use tokio::process::Command;
+
+    let probe = Command::new("ffprobe")
+        .args(["-v", "error", "-show_entries", "stream=codec_type,start_time", "-of", "csv=p=0"])
+        .arg(source)
+        .output()
+        .await
+        .context("failed to probe source stream start times")?;
+    if !probe.status.success() {
+        anyhow::bail!(
+            "ffprobe failed: {}",
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+    }
+    let stdout = String::from_utf8_lossy(&probe.stdout);
+    let first_start = |kind: &str| {
+        stdout
+            .lines()
+            .filter_map(|l| l.trim().split_once(','))
+            .find(|(k, _)| *k == kind)
+            .and_then(|(_, t)| t.trim().parse::<f64>().ok())
+    };
+    Ok(match (first_start("video"), first_start("audio")) {
+        (Some(video), Some(audio)) => (video - audio).max(0.0),
+        _ => 0.0,
+    })
+}
+
 /// Join the encoded segments listed in `list_path` into `output_path`.
 ///
 /// With `audio_source`, video comes from the segments and audio is copied
 /// from the source untouched, as the coordinator's `concatenate_mp4` does.
 /// Unlike there, no `-shortest`: a source whose audio ends early would
-/// otherwise lose its trailing video frames. Without a source, every stream
-/// is joined from the segments.
+/// otherwise lose its trailing video frames. Audio that starts before the
+/// source's first video frame is skipped, so the output's audio begins with
+/// its first frame. Without a source, every stream is joined from the
+/// segments.
 async fn join_segments(
     list_path: &std::path::Path,
     audio_source: Option<&std::path::Path>,
@@ -1133,9 +1167,21 @@ async fn join_segments(
     cmd.args(["-y", "-f", "concat", "-safe", "0", "-i"]).arg(list_path);
     match audio_source {
         Some(source) => {
+            // An input -ss is measured from the file's start, its earliest
+            // stream, so it starts the source at its first video frame. Stream
+            // copy would still keep the audio from before that point at
+            // negative timestamps behind an edit list; -copypriorss:a 0
+            // drops those packets.
+            let lead = audio_lead_secs(source).await?;
+            if lead > 0.001 {
+                cmd.arg("-ss").arg(format!("{lead:.6}"));
+            }
             cmd.arg("-i")
                 .arg(source)
                 .args(["-map", "0:v", "-map", "1:a?", "-c", "copy"]);
+            if lead > 0.001 {
+                cmd.args(["-copypriorss:a", "0"]);
+            }
         }
         None => {
             cmd.args(["-c", "copy"]);
@@ -1790,6 +1836,40 @@ mod tests {
         packets.into_iter().map(|(_, d)| d).collect()
     }
 
+    /// Audio packet pts in pts order.
+    fn audio_packet_times(file: &Path) -> Vec<f64> {
+        let csv = ffprobe(file, &["-select_streams", "a", "-show_entries", "packet=pts_time,duration_time", "-of", "csv=p=0"]);
+        let mut times: Vec<f64> = csv.lines().map(|l| l.split(',').next().unwrap().parse().unwrap()).collect();
+        times.sort_by(|a, b| a.total_cmp(b));
+        times
+    }
+
+    /// start_time of the file's first stream of `kind` ("v"/"a"). Unlike
+    /// stream_times, needs no duration, which MPEG-TS streams may not report.
+    fn stream_start(file: &Path, kind: &str) -> f64 {
+        let csv = ffprobe(file, &["-select_streams", kind, "-show_entries", "stream=start_time", "-of", "csv=p=0"]);
+        csv.lines().next().expect("stream").trim().parse().unwrap()
+    }
+
+    /// Cuts `source` into 2 s pieces the way segment_and_upload does, re-encodes
+    /// each piece's video as a worker would, and returns the concat list.
+    fn cut_and_encode(dir: &Path, source: &Path) -> std::path::PathBuf {
+        run(Command::new("ffmpeg").args(["-hide_banner", "-loglevel", "error", "-y", "-i"]).arg(source)
+            .args(["-c", "copy", "-map", "0", "-f", "segment", "-segment_time", "2", "-reset_timestamps", "1"])
+            .arg(dir.join("seg_%03d.ts")));
+        let mut list = String::new();
+        for i in 0..3 {
+            let out = dir.join(format!("out_{}.ts", i));
+            run(Command::new("ffmpeg").args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+                .arg(dir.join(format!("seg_{:03}.ts", i)))
+                .args(["-map", "0:v", "-c:v", "libx264", "-preset", "ultrafast", "-f", "mpegts"]).arg(&out));
+            list.push_str(&format!("file '{}'\n", out.display()));
+        }
+        let list_path = dir.join("concat.txt");
+        std::fs::write(&list_path, list).unwrap();
+        list_path
+    }
+
     // Cuts a clip the way segment_and_upload does, re-encodes each piece's
     // video as a worker would, then joins. A cut on a keyframe leaves audio
     // from just before the frame in the next piece, so audio joined from the
@@ -1809,19 +1889,7 @@ mod tests {
             "-f", "lavfi", "-i", "testsrc=duration=6:size=160x120:rate=25",
             "-f", "lavfi", "-i", "sine=frequency=440:duration=6",
             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "25", "-c:a", "aac", "-shortest"]).arg(&source));
-        run(Command::new("ffmpeg").args(["-hide_banner", "-loglevel", "error", "-y", "-i"]).arg(&source)
-            .args(["-c", "copy", "-map", "0", "-f", "segment", "-segment_time", "2", "-reset_timestamps", "1"])
-            .arg(dir.join("seg_%03d.ts")));
-        let mut list = String::new();
-        for i in 0..3 {
-            let out = dir.join(format!("out_{}.ts", i));
-            run(Command::new("ffmpeg").args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
-                .arg(dir.join(format!("seg_{:03}.ts", i)))
-                .args(["-map", "0:v", "-c:v", "libx264", "-preset", "ultrafast", "-f", "mpegts"]).arg(&out));
-            list.push_str(&format!("file '{}'\n", out.display()));
-        }
-        let list_path = dir.join("concat.txt");
-        std::fs::write(&list_path, list).unwrap();
+        let list_path = cut_and_encode(&dir, &source);
         let output = dir.join("output.mp4");
 
         join_segments(&list_path, Some(&source), &output).await.unwrap();
@@ -1836,6 +1904,44 @@ mod tests {
         let frame = 1024.0 / 44_100.0;
         for (i, d) in durations[..durations.len() - 1].iter().enumerate() {
             assert!((d - frame).abs() < 0.001, "audio packet {i} spans {d} s: a gap");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // An MPEG-TS source whose audio starts 0.2 s before its video. The joined
+    // video starts at the source's first video frame, so the audio from before
+    // that frame must be dropped, or all of it plays 0.2 s late.
+    #[tokio::test]
+    #[ignore = "needs ffmpeg; run in the builder image with --include-ignored"]
+    async fn joined_output_drops_source_audio_from_before_the_first_video_frame() {
+        let dir = std::env::temp_dir().join(format!("join-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.ts");
+        run(Command::new("ffmpeg").args(["-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=6.2",
+            "-itsoffset", "0.2", "-f", "lavfi", "-i", "testsrc=duration=6:size=160x120:rate=25",
+            "-map", "1:v", "-map", "0:a",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "25", "-c:a", "aac", "-f", "mpegts"]).arg(&source));
+        let src_v = stream_start(&source, "v");
+        let src_a = stream_start(&source, "a");
+        assert!(src_v - src_a > 0.15, "source audio must start before video: v {src_v}, a {src_a}");
+        let list_path = cut_and_encode(&dir, &source);
+        let output = dir.join("output.mp4");
+
+        join_segments(&list_path, Some(&source), &output).await.unwrap();
+
+        let (v_start, v_dur) = stream_times(&output, "v").expect("video stream");
+        let (a_start, a_dur) = stream_times(&output, "a").expect("audio stream");
+        assert!(v_start.abs() < 0.001 && (v_dur - 6.0).abs() < 0.05, "video {v_start} + {v_dur}");
+        assert!(a_start <= 0.024, "audio starts at {a_start}");
+        assert!((a_dur - v_dur).abs() <= 0.03, "audio {a_dur} s vs video {v_dur} s");
+        let from_first_frame = audio_packet_times(&source).iter().filter(|&&t| t >= src_v - 0.0005).count();
+        let out_packets = audio_packet_times(&output).len();
+        assert!(out_packets.abs_diff(from_first_frame) <= 1,
+            "{out_packets} audio packets out, {from_first_frame} in the source from its first video frame");
+        let durations = audio_packet_durations(&output);
+        for (i, d) in durations[..durations.len() - 1].iter().enumerate() {
+            assert!(*d <= 0.035, "audio packet {i} spans {d} s: a gap");
         }
         std::fs::remove_dir_all(&dir).ok();
     }

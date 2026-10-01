@@ -3132,6 +3132,19 @@ body::before {
       Cluster.connectToMaster(Cluster.els.clusterMaster.value);
     },
 
+    /* The server decides which master it talks to: outside desktop mode it
+     * ignores ?master= and uses its own CLUSTER_MASTER (resolveMaster in
+     * web/server.js). Show and remember that address, so a stale saved value
+     * or the built-in default never labels a different cluster. In desktop
+     * mode the server echoes the address it was given, so this is a no-op. */
+    adoptServerMaster: function(master) {
+      if (typeof master !== 'string' || !master || master === Cluster.master) return;
+      Cluster.master = master;
+      Cluster.els.clusterMaster.value = master;
+      try { localStorage.setItem('cluster.master', master); } catch (e) {}
+      Cluster.els.clusterMasterDisplay.textContent = master;
+    },
+
     stopPolling: function() {
       if (Cluster.pollTimer) { clearInterval(Cluster.pollTimer); Cluster.pollTimer = null; }
     },
@@ -3139,6 +3152,7 @@ body::before {
     refreshNodes: function() {
       if (!Cluster.master || Cluster.mode === 'off') return;
       API.clusterStatus(Cluster.master).then(function(data) {
+        if (data) Cluster.adoptServerMaster(data.master);
         if (data && data.error) {
           Cluster.connected = false;
           Cluster.setStatus(false, data.error);
