@@ -89,6 +89,12 @@ test("cluster mode accepts only mp4 and says why", () => {
   assert.deepEqual(r, { error: "Cluster mode produces MP4 only", field: "format" });
 });
 
+test("cluster mode ignores the local worker count the SPA always sends", () => {
+  // A 1-CPU web pod: the SPA's default of 5 workers must not block cluster requests.
+  assert.equal(validateTranscodeParams({ ...VALID, format: "mp4", workers: 5 }, { cluster: true, maxWorkers: 1 }), null);
+  assert.equal(validateTranscodeParams({ ...VALID, format: "mp4", workers: 5 }, { maxWorkers: 1 })?.field, "workers");
+});
+
 test("hls stays legal outside cluster mode", () => {
   assert.equal(validateTranscodeParams({ uploadId: "a.mp4", format: "hls" }, { maxWorkers: 8 }), null);
 });
