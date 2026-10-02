@@ -8,6 +8,7 @@ use std::time::Instant;
 use tempfile::TempDir;
 use tokio::process::Command;
 use tracing::{debug, error, info, warn};
+use transcoder_cluster::media::{self, MediaSummary, Recommendation};
 
 mod analyzer;
 mod segmenter;
@@ -108,20 +109,14 @@ struct WorkerResult {
     output_path: String,
 }
 
-/// Reasons a segment cannot be stream-copied.
-#[derive(Debug, Clone, Serialize)]
-enum CopyBlocker {
-    CodecMismatch { source: String, target: String },
-    ProfileIncompatible { source: String, target: String },
-    PixFmtMismatch { source: String, target: String },
-}
-
 /// Smart mode report output (JSON to stdout).
 #[derive(Debug, Serialize)]
 struct SmartReport {
     input: String,
     segments: Vec<SegmentReport>,
     summary: ReportSummary,
+    media: MediaSummary,
+    recommendation: Recommendation,
 }
 
 #[derive(Debug, Serialize)]
@@ -157,13 +152,30 @@ impl From<&segmenter::Segment> for SegmentDescriptor {
     }
 }
 
+/// The shared copy/encode mode name for these flags. Smart flags win over
+/// --copy, as they always have; --smart-report plans as plain smart.
+fn mode_from_args(args: &Args) -> &'static str {
+    if args.smart_auto {
+        "smart-auto"
+    } else if args.smart || args.smart_report {
+        "smart"
+    } else if args.copy {
+        "copy"
+    } else {
+        "normal"
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
 
     let log_level = if args.verbose { "debug" } else { "info" };
+    // Logs go to stderr: stdout carries the --smart-report JSON, which the
+    // web server parses whole.
     tracing_subscriber::fmt()
         .with_env_filter(log_level)
+        .with_writer(std::io::stderr)
         .init();
 
     // --copy, --smart, --smart-auto, --smart-report imply --fast (need ffprobe + pre-split)
@@ -202,7 +214,7 @@ async fn main() -> Result<()> {
     info!("Step 1: Analyzing video{}...", if fast { " (fast mode)" } else { "" });
     let analysis_start = Instant::now();
     let metadata = if fast {
-        analyzer::fast_analyze_video(input_path.to_str().unwrap())?
+        media::fast_analyze_video(input_path.to_str().unwrap())?
     } else {
         analyzer::analyze_video(input_path.to_str().unwrap())?
     };
@@ -270,7 +282,8 @@ async fn main() -> Result<()> {
 
     let has_text_subs = metadata.subtitle_tracks.iter().any(|t| t.is_text_based);
 
-    let presplit_paths: Option<Vec<PathBuf>> = if fast {
+    // The report never uses the pre-split files, so --smart-report skips the split.
+    let presplit_paths: Option<Vec<PathBuf>> = if fast && !args.smart_report {
         info!("Step 2.5: {}splitting {} segments...",
             if args.copy { "Stream-copy " } else { "Pre-" },
             segments.len()
@@ -304,102 +317,53 @@ async fn main() -> Result<()> {
     let pipeline_start = Instant::now();
 
     // --- Smart mode: decide copy vs encode per segment ---
+    let mode = mode_from_args(&args);
+    let ranges: Vec<(f64, f64)> = segments.iter().map(|s| (s.start_timestamp, s.end_timestamp)).collect();
+    let plan = media::plan_segments(&metadata, &ranges, mode, &args.encoder, args.crf, args.smart_tolerance);
+    let smart_tolerance = plan.tolerance;
 
-    // Auto-tune tolerance if --smart-auto
-    let smart_tolerance = if args.smart_auto && smart {
-        let target_bitrate = estimate_target_bitrate(
-            metadata.width, metadata.height, args.crf, &args.encoder,
-        );
-        let auto_tol = auto_tune_tolerance(&metadata.gop_stats, target_bitrate, args.smart_tolerance);
-        info!("Smart auto-tune: computed tolerance = ±{:.1}% (max ±{:.0}%)",
-            auto_tol * 100.0, args.smart_tolerance * 100.0);
-        auto_tol
-    } else {
-        args.smart_tolerance
-    };
-
-    // Check global copy-compatibility
-    let global_blockers = if smart {
-        let target_codec = encoder_to_codec(&args.encoder);
-        let blockers = check_copy_compatibility(&metadata, target_codec, &args.encoder);
-        if !blockers.is_empty() {
+    if smart {
+        if args.smart_auto {
+            info!("Smart auto-tune: computed tolerance = ±{:.1}% (max ±{:.0}%)",
+                smart_tolerance * 100.0, args.smart_tolerance * 100.0);
+        }
+        if !plan.blockers.is_empty() {
             info!("Smart mode global compatibility issues:");
-            for b in &blockers {
+            for b in &plan.blockers {
                 match b {
-                    CopyBlocker::CodecMismatch { source, target } =>
+                    media::CopyBlocker::CodecMismatch { source, target } =>
                         info!("  Codec mismatch: source={}, target={}", source, target),
-                    CopyBlocker::ProfileIncompatible { source, target } =>
+                    media::CopyBlocker::ProfileIncompatible { source, target } =>
                         info!("  Profile incompatible: source={}, target={}", source, target),
-                    CopyBlocker::PixFmtMismatch { source, target } =>
+                    media::CopyBlocker::PixFmtMismatch { source, target } =>
                         info!("  Pixel format mismatch: source={}, target={}", source, target),
                 }
             }
         }
-        blockers
-    } else {
-        vec![]
-    };
 
-    // If there are global blockers (codec/profile/pixfmt), force all segments to encode
-    let has_global_blocker = global_blockers.iter().any(|b| matches!(b,
-        CopyBlocker::CodecMismatch { .. } | CopyBlocker::ProfileIncompatible { .. } | CopyBlocker::PixFmtMismatch { .. }
-    ));
-
-    // Determine which segments can be stream-copied and which need re-encoding.
-    let segment_decisions: Vec<bool> = if smart {
-        let target_codec = encoder_to_codec(&args.encoder);
-        let target_bitrate = estimate_target_bitrate(
-            metadata.width, metadata.height, args.crf, &args.encoder,
-        );
-        let codec_match = target_codec == metadata.codec_name;
-
+        let target_codec = media::encoder_to_codec(&args.encoder);
         info!("Smart mode analysis:");
-        info!("  Source codec: {}, target codec: {} (match={})", metadata.codec_name, target_codec, codec_match);
+        info!("  Source codec: {}, target codec: {} (match={})",
+            metadata.codec_name, target_codec, target_codec == metadata.codec_name);
         info!("  Estimated target bitrate: {:.1} Mbps (tolerance=±{:.0}%)",
-            target_bitrate / 1_000_000.0, smart_tolerance * 100.0);
+            plan.target_bitrate / 1_000_000.0, smart_tolerance * 100.0);
 
-        if has_global_blocker {
+        if !plan.blockers.is_empty() {
             info!("  Global blocker detected — all segments will be re-encoded");
-            vec![false; segments.len()]
         } else {
-            segments.iter().map(|seg| {
-                if !codec_match {
-                    debug!("  Segment {}: ENCODE (codec mismatch)", seg.id);
-                    return false; // must encode
+            for (i, seg) in segments.iter().enumerate() {
+                match plan.bitrate_ratio[i] {
+                    None => debug!("  Segment {}: ENCODE (no GOP data)", seg.id),
+                    Some(ratio) if plan.copy[i] => info!("  Segment {}: COPY (bitrate {:.1} Mbps, ratio={:.2})",
+                        seg.id, ratio * plan.target_bitrate / 1_000_000.0, ratio),
+                    Some(ratio) => info!("  Segment {}: ENCODE (bitrate {:.1} Mbps, ratio={:.2}, out of ±{:.0}% range)",
+                        seg.id, ratio * plan.target_bitrate / 1_000_000.0, ratio, smart_tolerance * 100.0),
                 }
-                // Find GOPs that overlap this segment
-                let gop_bitrates: Vec<f64> = metadata.gop_stats.iter()
-                    .filter(|g| g.start_time < seg.end_timestamp && g.end_time > seg.start_timestamp)
-                    .map(|g| g.bitrate_bps)
-                    .collect();
-
-                if gop_bitrates.is_empty() {
-                    debug!("  Segment {}: ENCODE (no GOP data)", seg.id);
-                    return false;
-                }
-
-                let avg_bitrate = gop_bitrates.iter().sum::<f64>() / gop_bitrates.len() as f64;
-                let ratio = avg_bitrate / target_bitrate;
-                let in_range = ratio >= (1.0 - smart_tolerance) && ratio <= (1.0 + smart_tolerance);
-
-                if in_range {
-                    info!("  Segment {}: COPY (bitrate {:.1} Mbps, ratio={:.2})",
-                        seg.id, avg_bitrate / 1_000_000.0, ratio);
-                } else {
-                    info!("  Segment {}: ENCODE (bitrate {:.1} Mbps, ratio={:.2}, out of ±{:.0}% range)",
-                        seg.id, avg_bitrate / 1_000_000.0, ratio, smart_tolerance * 100.0);
-                }
-                in_range
-            }).collect()
+            }
         }
-    } else if args.copy {
-        // Copy mode: all segments are copied
-        vec![true; segments.len()]
-    } else {
-        // Normal mode: all segments are encoded
-        vec![false; segments.len()]
-    };
+    }
 
+    let segment_decisions = &plan.copy;
     let copy_count = segment_decisions.iter().filter(|&&d| d).count();
     let encode_count = segment_decisions.iter().filter(|&&d| !d).count();
 
@@ -410,35 +374,16 @@ async fn main() -> Result<()> {
 
     // Smart report mode: print JSON report and exit
     if args.smart_report {
-        let target_codec = encoder_to_codec(&args.encoder);
-        let target_bitrate = estimate_target_bitrate(
-            metadata.width, metadata.height, args.crf, &args.encoder,
-        );
-        let _ = target_codec; // used for logging above
+        let global_blockers: Vec<String> = plan.blockers.iter().map(media::describe_blocker).collect();
 
         let segment_reports: Vec<SegmentReport> = segments.iter().enumerate().map(|(i, seg)| {
-            let gop_bitrates: Vec<f64> = metadata.gop_stats.iter()
-                .filter(|g| g.start_time < seg.end_timestamp && g.end_time > seg.start_timestamp)
-                .map(|g| g.bitrate_bps)
-                .collect();
-            let avg_bitrate = if gop_bitrates.is_empty() { None } else {
-                Some(gop_bitrates.iter().sum::<f64>() / gop_bitrates.len() as f64)
-            };
-            let ratio = avg_bitrate.map(|ab| ab / target_bitrate);
-
-            let mut reasons = Vec::new();
-            if has_global_blocker {
-                for b in &global_blockers {
-                    reasons.push(format!("{:?}", b));
-                }
-            }
-            if !segment_decisions[i] && ratio.is_some() {
-                let r = ratio.unwrap();
-                if r < (1.0 - smart_tolerance) || r > (1.0 + smart_tolerance) {
+            let ratio = plan.bitrate_ratio[i];
+            let mut reasons = global_blockers.clone();
+            if let Some(r) = ratio {
+                if !segment_decisions[i] && (r < (1.0 - smart_tolerance) || r > (1.0 + smart_tolerance)) {
                     reasons.push(format!("bitrate ratio {:.2} outside ±{:.0}%", r, smart_tolerance * 100.0));
                 }
-            }
-            if gop_bitrates.is_empty() {
+            } else {
                 reasons.push("no GOP data".to_string());
             }
 
@@ -459,8 +404,10 @@ async fn main() -> Result<()> {
                 total_segments: segments.len(),
                 copy_segments: copy_count,
                 encode_segments: encode_count,
-                global_blockers: global_blockers.iter().map(|b| format!("{:?}", b)).collect(),
+                global_blockers: global_blockers.clone(),
             },
+            media: MediaSummary::from(&metadata),
+            recommendation: media::recommend(&metadata, &args.encoder, args.crf, args.smart_tolerance),
         };
 
         // JSON to stdout
@@ -810,7 +757,7 @@ fn generate_hls_playlist(
     results: &[WorkerResult],
     segments: &[segmenter::Segment],
     _fps: f64,
-    audio_tracks: &[analyzer::AudioTrackInfo],
+    audio_tracks: &[media::AudioTrackInfo],
     subtitle_vtt_files: &[(String, PathBuf)],
 ) -> Result<()> {
     use std::io::Write;
@@ -910,7 +857,7 @@ fn generate_hls_playlist(
 fn concatenate_mp4(
     output_path: &Path,
     results: &[WorkerResult],
-    chapters: &[analyzer::ChapterInfo],
+    chapters: &[media::ChapterInfo],
     audio_source: Option<&str>,
 ) -> Result<()> {
     use std::io::Write;
@@ -1091,157 +1038,10 @@ async fn presplit_segments(
     Ok(paths)
 }
 
-/// Map encoder name to the codec name that ffprobe reports.
-fn encoder_to_codec(encoder: &str) -> &str {
-    match encoder {
-        "libx264" | "h264_videotoolbox" | "videotoolbox" | "h264_nvenc" | "h264_vaapi" => "h264",
-        "libx265" | "hevc_videotoolbox" | "hevc_nvenc" | "hevc_vaapi" => "hevc",
-        "libvpx-vp9" => "vp9",
-        "libaom-av1" | "libsvtav1" | "av1_nvenc" => "av1",
-        other => other,
-    }
-}
-
-/// Estimate the target bitrate (bps) for a given resolution and CRF.
-///
-/// These are empirical estimates for typical video content at CRF 23.
-/// Used by smart mode to decide if source GOPs are close enough to skip re-encoding.
-fn estimate_target_bitrate(width: u32, height: u32, crf: u32, encoder: &str) -> f64 {
-    let pixels = width as f64 * height as f64;
-
-    // Base bitrate estimates for CRF 23 at common resolutions
-    let base_bitrate = if pixels >= 3840.0 * 2160.0 {
-        40_000_000.0  // 4K: ~40 Mbps
-    } else if pixels >= 1920.0 * 1080.0 {
-        8_000_000.0   // 1080p: ~8 Mbps
-    } else if pixels >= 1280.0 * 720.0 {
-        4_000_000.0   // 720p: ~4 Mbps
-    } else {
-        2_000_000.0   // SD: ~2 Mbps
-    };
-
-    // CRF adjustment: each CRF unit roughly corresponds to ~12% bitrate change
-    // CRF 23 is our baseline
-    let crf_factor = 1.12f64.powi(23i32 - crf as i32);
-
-    // Encoder efficiency factors relative to libx264 baseline:
-    // - H.265/HEVC achieves ~50% bitrate at equivalent quality
-    // - AV1 achieves ~30-40% bitrate at equivalent quality
-    // - VideoToolbox produces higher bitrate than software encoders
-    let encoder_factor = match encoder {
-        e if e.contains("videotoolbox") && e.contains("hevc") => 1.0,
-        e if e.contains("videotoolbox") => 2.0,
-        e if e.contains("nvenc") && (e.contains("hevc") || e.contains("av1")) => 0.7,
-        e if e.contains("nvenc") => 1.5,
-        e if e.contains("vaapi") && e.contains("hevc") => 0.8,
-        e if e.contains("vaapi") => 1.5,
-        "libx265" | "hevc_nvenc" | "hevc_vaapi" => 0.5,
-        "libsvtav1" => 0.4,
-        "libaom-av1" => 0.35,
-        "av1_nvenc" => 0.5,
-        _ => 1.0,
-    };
-
-    base_bitrate * crf_factor * encoder_factor
-}
-
-/// Check global copy-compatibility between source and target encoding settings.
-fn check_copy_compatibility(
-    metadata: &analyzer::VideoMetadata,
-    target_codec: &str,
-    encoder: &str,
-) -> Vec<CopyBlocker> {
-    let mut blockers = Vec::new();
-
-    // Codec check
-    if target_codec != metadata.codec_name {
-        blockers.push(CopyBlocker::CodecMismatch {
-            source: metadata.codec_name.clone(),
-            target: target_codec.to_string(),
-        });
-    }
-
-    // Profile compatibility (only for H.264)
-    if target_codec == "h264" && metadata.profile.is_some() {
-        let source_profile = metadata.profile.as_deref().unwrap();
-        let target_profile = encoder_target_profile(encoder);
-        if !is_profile_compatible(source_profile, target_profile) {
-            blockers.push(CopyBlocker::ProfileIncompatible {
-                source: source_profile.to_string(),
-                target: target_profile.to_string(),
-            });
-        }
-    }
-
-    // Pixel format check
-    if let Some(ref src_pix_fmt) = metadata.pix_fmt {
-        let target_pix = encoder_target_pix_fmt(encoder);
-        if src_pix_fmt != target_pix {
-            blockers.push(CopyBlocker::PixFmtMismatch {
-                source: src_pix_fmt.clone(),
-                target: target_pix.to_string(),
-            });
-        }
-    }
-
-    blockers
-}
-
-/// Rank H.264 profiles: Baseline < Main < High
-fn profile_rank(profile: &str) -> u32 {
-    match profile.to_lowercase().as_str() {
-        "baseline" | "constrained baseline" => 1,
-        "main" => 2,
-        "high" | "high 10" | "high 4:2:2" | "high 4:4:4" | "high 4:4:4 predictive" => 3,
-        _ => 2, // default to Main
-    }
-}
-
-/// Check if source profile is compatible with target (source rank <= target rank).
-fn is_profile_compatible(source: &str, target: &str) -> bool {
-    profile_rank(source) <= profile_rank(target)
-}
-
-/// Default target profile for an encoder.
-fn encoder_target_profile(encoder: &str) -> &str {
-    match encoder {
-        "h264_videotoolbox" | "videotoolbox" => "Main",
-        "libx264" => "High",
-        _ => "High",
-    }
-}
-
-/// Default target pixel format for an encoder.
-fn encoder_target_pix_fmt(encoder: &str) -> &str {
-    match encoder {
-        "libx264" | "h264_videotoolbox" | "videotoolbox" => "yuv420p",
-        "libx265" | "hevc_videotoolbox" => "yuv420p",
-        _ => "yuv420p",
-    }
-}
-
-/// Auto-tune smart tolerance from GOP bitrate distribution.
-fn auto_tune_tolerance(gop_stats: &[analyzer::GopStats], target_bitrate: f64, max_tolerance: f64) -> f64 {
-    if gop_stats.is_empty() || target_bitrate <= 0.0 {
-        return max_tolerance;
-    }
-
-    let ratios: Vec<f64> = gop_stats.iter().map(|g| g.bitrate_bps / target_bitrate).collect();
-    let n = ratios.len() as f64;
-    let mean = ratios.iter().sum::<f64>() / n;
-    let variance = ratios.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / n;
-    let stddev = variance.sqrt();
-
-    // Tight cluster near target = tight tolerance; spread out = wider tolerance
-    let tolerance = (2.0 * stddev - (mean - 1.0).abs()).clamp(0.05, max_tolerance);
-
-    tolerance
-}
-
 /// Extract text-based subtitle tracks as WebVTT files for HLS.
 async fn extract_subtitles_as_webvtt(
     input_path: &str,
-    subtitle_tracks: &[analyzer::SubtitleTrackInfo],
+    subtitle_tracks: &[media::SubtitleTrackInfo],
     output_dir: &Path,
 ) -> Result<Vec<(String, PathBuf)>> {
     let mut results = Vec::new();
@@ -1330,7 +1130,7 @@ fn find_worker_binary() -> Result<PathBuf> {
 async fn run_cluster_mode(
     args: &Args,
     input_path: &Path,
-    _metadata: &analyzer::VideoMetadata,
+    _metadata: &media::VideoMetadata,
     _segments: &[segmenter::Segment],
 ) -> Result<()> {
     use transcoder_cluster::protocol::*;
@@ -1364,6 +1164,8 @@ async fn run_cluster_mode(
             format: args.format.clone(),
             fast_mode: args.fast,
             hw_decode: false,
+            mode: mode_from_args(args).to_string(),
+            smart_tolerance: args.smart_tolerance,
         },
         srt_input_url: None,
     };
