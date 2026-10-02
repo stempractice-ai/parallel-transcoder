@@ -39,5 +39,9 @@ tokio-tungstenite = "0.24"
 # Used when --object-store-url is set; the SRT data plane remains the
 # default for desktop / LAN clusters.
 aws-config = { version = "1", features = ["behavior-version-latest"] }
-aws-sdk-s3 = "1"
+# default-features = false drops the default `rustls` feature, which pulls in a
+# second, legacy TLS stack (rustls 0.21 via hyper-rustls 0.24) next to the
+# rustls 0.23 client that `default-https-client` already provides. The other
+# default features are kept.
+aws-sdk-s3 = { version = "1", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
 aws-credential-types = "1"
