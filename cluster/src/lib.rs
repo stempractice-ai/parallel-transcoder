@@ -6,6 +6,7 @@ pub mod object_store;
 pub mod election;
 pub mod node;
 pub mod scheduler;
+pub mod media;
 
 pub use protocol::*;
 pub use transport::Transport;

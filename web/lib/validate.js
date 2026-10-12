@@ -93,8 +93,13 @@ export function validateTranscodeParams(
   const crf = checkInt(body, "crf", 0, 63);
   if (crf) return crf;
 
-  const workers = checkInt(body, "workers", 0, maxWorkers);
-  if (workers) return workers;
+  // The local coordinator's worker count is capped at this host's CPUs. Cluster
+  // routes never use it, and the SPA always sends one (default 5), so a
+  // 1-CPU web pod would reject every cluster request from the UI.
+  if (!cluster) {
+    const workers = checkInt(body, "workers", 0, maxWorkers);
+    if (workers) return workers;
+  }
 
   if (body.smartTolerance !== undefined) {
     const t = body.smartTolerance;

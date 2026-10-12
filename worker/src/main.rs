@@ -61,6 +61,10 @@ struct Args {
     /// Enable VideoToolbox hardware decoding (macOS only)
     #[arg(long)]
     hw_decode: bool,
+
+    /// Stream-copy this pre-cut segment's video instead of re-encoding it.
+    #[arg(long)]
+    copy: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,7 +118,11 @@ fn main() -> Result<()> {
 
     let start_time = Instant::now();
 
-    let frames_encoded = transcode_segment(&args, &segment)?;
+    let frames_encoded = if args.copy {
+        copy_segment(&args, &segment)?
+    } else {
+        transcode_segment(&args, &segment)?
+    };
 
     let encoding_time = start_time.elapsed().as_secs_f64();
     let output_size = std::fs::metadata(&args.output)
@@ -228,6 +236,122 @@ fn copy_audio_packet(
     Ok(())
 }
 
+/// Optional audio passthrough (stream copy, no re-encode): adds the source's
+/// best audio stream to `octx`. Returns (index_in, time_base_in, index_out),
+/// or None if the source has no audio track or the muxer has no matching
+/// codec support for it.
+fn add_audio_passthrough(
+    ictx: &format::context::Input,
+    octx: &mut format::context::Output,
+) -> Result<Option<(usize, Rational, usize)>> {
+    Ok(match ictx.streams().best(Type::Audio) {
+        Some(a_stream) => {
+            let a_index = a_stream.index();
+            let a_tb = a_stream.time_base();
+            let params = a_stream.parameters();
+            match ffmpeg::encoder::find(params.id()) {
+                Some(audio_codec) => {
+                    let mut aost = octx
+                        .add_stream(audio_codec)
+                        .context("Failed to add output audio stream")?;
+                    aost.set_parameters(params);
+                    // Standard remux gotcha: a stale codec_tag from the
+                    // source container can confuse the target muxer.
+                    unsafe {
+                        (*aost.parameters().as_mut_ptr()).codec_tag = 0;
+                    }
+                    let out_index = aost.index();
+                    info!("Audio passthrough: input stream {} -> output stream {}", a_index, out_index);
+                    Some((a_index, a_tb, out_index))
+                }
+                None => {
+                    warn!("No muxer support for input audio codec, dropping audio track");
+                    None
+                }
+            }
+        }
+        None => None,
+    })
+}
+
+/// The instant output frame 0 stands for, in seconds: the video stream's start
+/// on a presplit segment, the segment's start when seeking the full source.
+fn video_origin_secs(input_stream: &ffmpeg::Stream, presplit: bool, segment: &SegmentDescriptor) -> f64 {
+    if presplit {
+        let start = input_stream.start_time();
+        if start == sys::AV_NOPTS_VALUE {
+            0.0
+        } else {
+            let tb = input_stream.time_base();
+            start as f64 * f64::from(tb.numerator()) / f64::from(tb.denominator())
+        }
+    } else {
+        segment.start_timestamp
+    }
+}
+
+/// Stream-copies a pre-cut segment's video, re-based so it starts at 0 like
+/// an encoded segment, plus its audio. Returns the number of video packets
+/// copied.
+fn copy_segment(args: &Args, segment: &SegmentDescriptor) -> Result<u64> {
+    if !args.presplit {
+        anyhow::bail!("--copy needs --presplit: it copies a pre-cut segment whole");
+    }
+
+    ffmpeg::init().context("Failed to initialize FFmpeg")?;
+
+    let mut ictx = input(&args.input).context("Failed to open input video")?;
+    let input_stream = ictx
+        .streams()
+        .best(Type::Video)
+        .ok_or_else(|| anyhow::anyhow!("No video stream found"))?;
+    let video_stream_index = input_stream.index();
+    let in_tb = input_stream.time_base();
+    let origin_secs = video_origin_secs(&input_stream, true, segment);
+    let params = input_stream.parameters();
+
+    let mut octx = format::output(&args.output).context("Failed to create output file")?;
+    {
+        let codec = ffmpeg::encoder::find(params.id())
+            .ok_or_else(|| anyhow::anyhow!("no muxer support for the source video codec"))?;
+        let mut ost = octx.add_stream(codec).context("Failed to add output stream")?;
+        ost.set_parameters(params);
+        unsafe {
+            (*ost.parameters().as_mut_ptr()).codec_tag = 0;
+        }
+    }
+    let audio_info = add_audio_passthrough(&ictx, &mut octx)?;
+
+    octx.write_header().context("Failed to write output header")?;
+    let out_tb = octx.stream(0).unwrap().time_base();
+    let origin = origin_ticks(origin_secs, in_tb.numerator(), in_tb.denominator());
+
+    let mut copied: u64 = 0;
+    for (stream, mut packet) in ictx.packets() {
+        let stream_index = stream.index();
+        if stream_index == video_stream_index {
+            let Some(pts) = packet.pts().and_then(|p| rebase_ts(p, origin)) else { continue };
+            packet.set_pts(Some(pts));
+            if let Some(dts) = packet.dts() {
+                packet.set_dts(Some(dts - origin));
+            }
+            packet.rescale_ts(in_tb, out_tb);
+            packet.set_stream(0);
+            packet.set_position(-1);
+            packet.write_interleaved(&mut octx)?;
+            copied += 1;
+        } else if let Some((audio_index, audio_tb, audio_out_index)) = audio_info {
+            if stream_index == audio_index {
+                copy_audio_packet(packet, audio_tb, audio_out_index, true, segment, origin_secs, &mut octx)?;
+            }
+        }
+    }
+
+    octx.write_trailer().context("Failed to write output trailer")?;
+    info!("Copied {} video packets", copied);
+    Ok(copied)
+}
+
 fn transcode_segment(
     args: &Args,
     segment: &SegmentDescriptor,
@@ -247,19 +371,7 @@ fn transcode_segment(
 
     let video_stream_index = input_stream.index();
     let input_time_base = input_stream.time_base();
-    // The instant output video frame 0 stands for: the video stream's start
-    // on a presplit segment, the segment's start when seeking the full source.
-    let video_origin_secs = if presplit {
-        let start = input_stream.start_time();
-        if start == sys::AV_NOPTS_VALUE {
-            0.0
-        } else {
-            start as f64 * f64::from(input_time_base.numerator())
-                / f64::from(input_time_base.denominator())
-        }
-    } else {
-        segment.start_timestamp
-    };
+    let video_origin_secs = video_origin_secs(&input_stream, presplit, segment);
     let avg_frame_rate = input_stream.avg_frame_rate();
 
     let codec_params = input_stream.parameters();
@@ -505,39 +617,7 @@ fn transcode_segment(
 
     let encoder_tb = opened_encoder.time_base();
 
-    // --- Optional audio passthrough (stream copy, no re-encode) ---
-    // (index_in, time_base_in, index_out), or None if the source has no
-    // audio track or the muxer has no matching codec support for it.
-    let audio_info: Option<(usize, Rational, usize)> = {
-        match ictx.streams().best(Type::Audio) {
-            Some(a_stream) => {
-                let a_index = a_stream.index();
-                let a_tb = a_stream.time_base();
-                let params = a_stream.parameters();
-                match ffmpeg::encoder::find(params.id()) {
-                    Some(audio_codec) => {
-                        let mut aost = octx
-                            .add_stream(audio_codec)
-                            .context("Failed to add output audio stream")?;
-                        aost.set_parameters(params);
-                        // Standard remux gotcha: a stale codec_tag from the
-                        // source container can confuse the target muxer.
-                        unsafe {
-                            (*aost.parameters().as_mut_ptr()).codec_tag = 0;
-                        }
-                        let out_index = aost.index();
-                        info!("Audio passthrough: input stream {} -> output stream {}", a_index, out_index);
-                        Some((a_index, a_tb, out_index))
-                    }
-                    None => {
-                        warn!("No muxer support for input audio codec, dropping audio track");
-                        None
-                    }
-                }
-            }
-            None => None,
-        }
-    };
+    let audio_info = add_audio_passthrough(&ictx, &mut octx)?;
 
     octx.write_header().context("Failed to write output header")?;
 
@@ -846,5 +926,91 @@ mod tests {
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"frames_encoded\":300"));
         assert!(json.contains("\"worker_id\":1"));
+    }
+}
+
+#[cfg(test)]
+mod copy_tests {
+    use super::*;
+    use std::path::Path;
+    use std::process::Command;
+
+    fn run(cmd: &mut Command) -> String {
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "{:?}: {}", cmd, String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    fn probe(path: &Path, select: &str, entries: &str) -> String {
+        run(Command::new("ffprobe").args(["-v", "error", "-select_streams", select, "-show_entries", entries, "-of", "csv=p=0"]).arg(path))
+    }
+
+    fn first_line(s: &str) -> String {
+        s.lines().find(|l| !l.trim().is_empty()).unwrap_or_default().trim().trim_end_matches(',').to_string()
+    }
+
+    #[test]
+    #[ignore = "needs ffmpeg; run in the builder image with --include-ignored"]
+    fn copy_segment_rebases_video_to_zero_and_keeps_every_packet() {
+        let dir = std::env::temp_dir().join(format!("copy-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.mp4");
+        run(Command::new("ffmpeg").args(["-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i", "testsrc=duration=4:size=320x240:rate=25",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=4",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "25", "-c:a", "aac", "-shortest"]).arg(&source));
+        run(Command::new("ffmpeg").args(["-hide_banner", "-loglevel", "error", "-y", "-i"]).arg(&source)
+            .args(["-c", "copy", "-map", "0", "-f", "segment", "-segment_time", "2", "-reset_timestamps", "1"])
+            .arg(dir.join("seg_%03d.ts")));
+        let seg = dir.join("seg_001.ts");
+        let out = dir.join("out.ts");
+        let args = Args {
+            segment: None,
+            input: seg.to_string_lossy().into_owned(),
+            output: out.to_string_lossy().into_owned(),
+            worker_id: 0,
+            bitrate: 0,
+            crf: 23,
+            preset: "medium".into(),
+            encoder: "libx264".into(),
+            verbose: false,
+            presplit: true,
+            hw_decode: false,
+            copy: true,
+        };
+        let segment = SegmentDescriptor {
+            id: 1,
+            start_frame: 0,
+            end_frame: 50,
+            start_timestamp: 2.0,
+            end_timestamp: 4.0,
+            lookahead_frames: None,
+            complexity_estimate: 0.5,
+            scene_changes: vec![],
+        };
+        let copied = copy_segment(&args, &segment).unwrap();
+        // The encoded twin: the join treats both kinds of segment alike, so
+        // the copy must land on the same timeline as an encode.
+        let encoded = dir.join("encoded.ts");
+        let enc_args = Args { output: encoded.to_string_lossy().into_owned(), copy: false, preset: "veryfast".into(), ..args };
+        transcode_segment(&enc_args, &segment).unwrap();
+
+        let count = |p: &Path| probe(p, "v", "packet=pts").lines().filter(|l| !l.trim().is_empty()).count();
+        let start = |p: &Path, s: &str| -> f64 { first_line(&probe(p, s, "stream=start_time")).parse().unwrap() };
+        let (in_packets, out_packets) = (count(&seg), count(&out));
+        let first_dts: f64 = first_line(&probe(&out, "v", "packet=dts_time")).parse().unwrap();
+        let (v_start, a_start, enc_start) = (start(&out, "v"), start(&out, "a"), start(&encoded, "v"));
+        let codec = first_line(&probe(&out, "v", "stream=codec_name"));
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(out_packets, in_packets);
+        assert_eq!(copied as usize, in_packets);
+        // Re-based to 0: the first packet decodes at 0. MPEG-TS start_time is
+        // the first pts, which sits the B-frame delay later, exactly as on the
+        // encoded twin.
+        assert!(first_dts.abs() < 0.001, "video first dts {first_dts}");
+        assert!((v_start - enc_start).abs() < 0.001, "video start_time {v_start}, encoded {enc_start}");
+        assert!(a_start - v_start <= 0.024, "audio start_time {a_start}, video {v_start}");
+        assert_eq!(codec, "h264");
     }
 }

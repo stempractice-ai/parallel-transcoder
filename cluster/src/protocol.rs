@@ -40,6 +40,8 @@ pub enum OpCode {
     JobComplete = 33,
     JobFailed = 34,
     JobCancel = 35,
+    AnalyzeRequest = 36,
+    AnalyzeResult = 37,
 
     // Segment distribution
     SegmentAssign = 40,
@@ -163,6 +165,20 @@ pub struct EncodingConfig {
     pub format: String,
     pub fast_mode: bool,
     pub hw_decode: bool,
+    /// "normal", "copy", "smart" or "smart-auto"; older senders omit it.
+    #[serde(default = "default_mode")]
+    pub mode: String,
+    /// Bitrate tolerance for the smart modes.
+    #[serde(default = "default_smart_tolerance")]
+    pub smart_tolerance: f64,
+}
+
+fn default_mode() -> String {
+    "normal".into()
+}
+
+fn default_smart_tolerance() -> f64 {
+    0.3
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -190,6 +206,25 @@ pub struct JobProgressData {
     pub phase: String,
 }
 
+// --- Analysis payloads ---
+
+/// Asks the master to probe a source and recommend a mode and preset.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalyzeRequestData {
+    pub request_id: Uuid,
+    pub source_url: String,
+    pub encoder: String,
+    pub crf: u32,
+    pub smart_tolerance: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalyzeResultData {
+    pub request_id: Uuid,
+    pub media: crate::media::MediaSummary,
+    pub recommendation: crate::media::Recommendation,
+}
+
 // --- Segment payloads ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,6 +238,9 @@ pub struct SegmentDescriptor {
     pub lookahead_frames: Option<usize>,
     pub complexity_estimate: f32,
     pub scene_changes: Vec<u64>,
+    /// Stream-copy this segment's video instead of re-encoding it.
+    #[serde(default)]
+    pub copy: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -399,6 +437,7 @@ mod tests {
                 lookahead_frames: Some(30),
                 complexity_estimate: 0.75,
                 scene_changes: vec![1200, 1800],
+                copy: false,
             },
             srt_url: "srt://192.168.1.1:9100?mode=caller".into(),
             encoding_config: EncodingConfig {
@@ -408,6 +447,8 @@ mod tests {
                 format: "hls".into(),
                 fast_mode: false,
                 hw_decode: true,
+                mode: "normal".into(),
+                smart_tolerance: 0.3,
             },
         };
         let msg = Message::new(OpCode::SegmentAssign, &assign).unwrap();
@@ -455,6 +496,24 @@ mod tests {
         // Deserialize from numeric form (what the JS web server sends).
         let m: Message = serde_json::from_str(r#"{"op":50,"d":{}}"#).unwrap();
         assert_eq!(m.op, OpCode::StatusRequest);
+
+        assert_eq!(serde_json::to_string(&OpCode::AnalyzeRequest).unwrap(), "36");
+        assert_eq!(serde_json::to_string(&OpCode::AnalyzeResult).unwrap(), "37");
+    }
+
+    #[test]
+    fn test_encoding_config_defaults_mode_when_absent() {
+        let json = r#"{"crf":23,"preset":"medium","encoder":"libx264","format":"mp4","fast_mode":false,"hw_decode":false}"#;
+        let c: EncodingConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(c.mode, "normal");
+        assert_eq!(c.smart_tolerance, 0.3);
+    }
+
+    #[test]
+    fn test_segment_descriptor_defaults_copy_false() {
+        let json = r#"{"id":0,"start_frame":0,"end_frame":60,"start_timestamp":0.0,"end_timestamp":2.0,"complexity_estimate":0.5,"scene_changes":[]}"#;
+        let s: SegmentDescriptor = serde_json::from_str(json).unwrap();
+        assert!(!s.copy);
     }
 
     #[test]

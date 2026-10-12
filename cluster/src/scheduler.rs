@@ -235,6 +235,7 @@ impl Scheduler {
                     lookahead_frames: None,
                     complexity_estimate: 0.5,
                     scene_changes: vec![],
+                    copy: false,
                 };
                 warn!(
                     %job_id,
@@ -366,6 +367,7 @@ mod tests {
             lookahead_frames: Some(30),
             complexity_estimate: complexity,
             scene_changes: vec![],
+            copy: false,
         }
     }
 
