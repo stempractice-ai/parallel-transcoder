@@ -11,6 +11,7 @@ import { pipeline } from "stream/promises";
 import { fileURLToPath } from "url";
 import http from "http";
 import https from "https";
+import rateLimit from "express-rate-limit";
 import { S3Client, PutObjectCommand, GetObjectCommand, HeadBucketCommand } from "@aws-sdk/client-s3";
 import * as ociCommon from "oci-common";
 import { ContainerEngineClient } from "oci-containerengine";
@@ -1115,7 +1116,14 @@ app.post("/api/cluster/transcode", async (req, res) => {
 
 // Analyse an uploaded source on the cluster master and return its
 // recommendation. The source copy is reused by the transcode that follows.
-app.post("/api/cluster/analyze", async (req, res) => {
+const clusterAnalyzeLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 30, // limit each IP to 30 analyze requests per minute
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+app.post("/api/cluster/analyze", clusterAnalyzeLimiter, async (req, res) => {
   let master;
   try { master = resolveMaster(req); }
   catch (err) { return res.status(err.statusCode || 400).json({ error: err.message }); }
